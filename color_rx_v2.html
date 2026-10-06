@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>空間差分色碼接收端</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#0f0f0f;color:#ddd;font-family:system-ui,"Noto Sans TC",sans-serif}
+  #wrap{max-width:720px;margin:0 auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+  #vbox{position:relative;width:100%;background:#000;min-height:120px;border-radius:6px;overflow:hidden}
+  #v{width:100%;display:block}
+  #ov{position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none}
+  .row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+  .row>*{flex:1;min-width:130px}
+  label{font-size:12px;color:#999;display:flex;flex-direction:column;gap:3px}
+  input,select,button,textarea{font-size:16px;padding:8px;border-radius:5px;border:2px solid #555;width:100%;background:#1a1a1a;color:#eee}
+  button{background:#2b6;color:#fff;border:0;cursor:pointer}
+  button.stop{background:#c44}
+  button.sec{background:#444}
+  input[type=range]{padding:0}
+  #live{display:flex;gap:6px}
+  #live div{flex:1;height:44px;border-radius:4px;border:1px solid #444;font:10px/1.2 monospace;display:flex;align-items:flex-end;padding:2px;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000}
+  #status{font:13px/1.6 monospace;color:#8c8;white-space:pre-wrap;min-height:60px}
+  #packets{font:14px/1.9 monospace;word-break:break-all;max-height:200px;overflow:auto}
+  #packets span{padding:1px 4px;margin:1px;border-radius:3px;display:inline-block;background:#1f2a22;color:#cfc}
+  #packets span.warn{background:#5a4a14;color:#fe9}
+  #packets span.bad{background:#6a1f1f;color:#fcc}
+  textarea{font-family:monospace;min-height:90px;resize:vertical}
+  small{color:#888}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="vbox"><video id="v" playsinline muted autoplay></video><canvas id="ov"></canvas></div>
+
+  <div class="row">
+    <button id="cam">啟動相機</button>
+    <button id="lock" class="sec">嘗試鎖定曝光／白平衡</button>
+  </div>
+
+  <div class="row">
+    <label>取樣範圍大小（拖曳畫面上的框移動位置）
+      <input type="range" id="size" min="15" max="95" value="60"></label>
+    <label>畫面旋轉（發射端畫面在相機中的方向）
+      <select id="rot">
+        <option value="0">0°（左上=−10，右上=+10）</option>
+        <option value="90">順時針 90°</option>
+        <option value="180">180°</option>
+        <option value="270">逆時針 90°</option>
+      </select></label>
+  </div>
+
+  <div class="row">
+    <label>封包時間 ms（需與發射端相同）<input id="ms" type="number" value="100" min="80" step="10"></label>
+    <label>原始 hex 長度（選填，用來去掉補的 0）<input id="len" type="number" min="1" placeholder="例如 180"></label>
+  </div>
+
+  <div class="row">
+    <button id="go">開始接收</button>
+    <button id="rst" class="sec">重置</button>
+  </div>
+
+  <div id="live"><div id="sA">−10</div><div id="sB">+10</div><div id="sG">灰階</div><div id="sK">黑</div></div>
+  <div id="status">請先啟動相機，把發射端畫面的四個色塊對準取樣框。</div>
+
+  <label>解碼出的封包（橘 = 信心偏低，紅 = 疑似錯誤）</label>
+  <div id="packets"></div>
+  <label>hex 輸出</label>
+  <textarea id="hex" readonly></textarea>
+  <button id="copy" class="sec">複製 hex</button>
+  <label>文字輸出（每 6 個 hex 字元 = 1 個字；去掉尾端的 f 後，當十進位 Unicode）</label>
+  <textarea id="textOut" readonly></textarea>
+  <button id="copyText" class="sec">複製文字</button>
+  <small>需要 https 或 localhost 才能使用相機。請使用後置鏡頭、固定手機（最好用支架）、固定螢幕亮度。</small>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* ============================================================
+   分析核心（與 DOM 無關）
+   每個 frame：{t: 時間(ms), f: Float32Array(12)}
+   f 的排列 = 邏輯區塊 A(左上 −10) 0..2、B(右上 +10) 3..5、G(左下 灰階) 6..8、K(右下 黑) 9..11，各為 R,G,B
+   ============================================================ */
+/*ANALYSIS_START*/
+let frames = [], calObj = null;
+const failed = new Set();
+const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
+const mean3 = (f,o) => (f[o]+f[o+1]+f[o+2]) / 3;
+
+/* 校準第 0 格：A 很亮(246)、B 很暗(10)，三個通道都是 */
+function isCal0(f){
+  for(let c=0;c<3;c++){
+    if(!(f[c] > 1.25*f[6+c] && f[3+c] < 0.55*f[6+c])) return false;
+  }
+  return true;
+}
+function lowerBound(x){
+  let lo=0, hi=frames.length;
+  while(lo<hi){ const m=(lo+hi)>>1; if(frames[m].t < x) lo=m+1; else hi=m; }
+  return lo;
+}
+/* 時間窗內的平均（以灰階區塊 G 為基準做曝光正規化；Gref 為 null 時不正規化）
+   回傳 Float32Array(12)，其中 G 保持原始值方便偵測漂移 */
+function windowNorm(t1, t2, Gref){
+  let lo = lowerBound(t1), hi = lowerBound(t2), idx = [];
+  for(let i=lo;i<hi;i++) idx.push(i);
+  if(!idx.length){
+    const c = (t1+t2)/2;
+    if(!frames.length) return null;
+    let j = lowerBound(c);
+    if(j >= frames.length) j = frames.length-1;
+    if(j > 0 && Math.abs(frames[j-1].t-c) < Math.abs(frames[j].t-c)) j--;
+    if(Math.abs(frames[j].t - c) > 120) return null;
+    idx = [j];
+  }
+  const o = new Float32Array(12);
+  /* 灰階的曝光/增益只會緩慢漂移，所以用窗外前後各 4 個 frame 一起平均，
+     得到平滑的縮放係數，避免單一 frame 的雜訊被放大到其他區塊 */
+  const g0 = Math.max(0, idx[0]-4), g1 = Math.min(frames.length-1, idx[idx.length-1]+4);
+  const gm = [0,0,0];
+  for(let i=g0;i<=g1;i++) for(let c=0;c<3;c++) gm[c] += frames[i].f[6+c];
+  for(let c=0;c<3;c++) gm[c] /= (g1-g0+1);
+  const sc = [0,1,2].map(c => Gref ? clamp(Gref[c] / Math.max(gm[c],1), 0.5, 2) : 1);
+  for(const i of idx){
+    const f = frames[i].f;
+    for(let c=0;c<3;c++){
+      o[c]   += f[c]*sc[c];
+      o[3+c] += f[3+c]*sc[c];
+      o[6+c] += f[6+c];
+      o[9+c] += f[9+c]*sc[c];
+    }
+  }
+  for(let k=0;k<12;k++) o[k] /= idx.length;
+  return o;
+}
+/* 用 16 格校準的「格內變異最小」找出精確起點 t0 */
+function refineT0(tg, T){
+  const lumAB = f => mean3(f,0) + mean3(f,3);
+  const scores = []; let minS = Infinity;
+  for(let off=-0.6*T; off<=0.6*T; off+=2){
+    const t0 = tg + off; let s = 0;
+    for(let k=0;k<16;k++){
+      const lo = lowerBound(t0 + k*T + 0.1*T), hi = lowerBound(t0 + (k+1)*T - 0.1*T);
+      const n = hi - lo;
+      if(n < 2){ s += 1e6; continue; }
+      let m=0, m2=0;
+      for(let i=lo;i<hi;i++){ const v = lumAB(frames[i].f); m+=v; m2+=v*v; }
+      s += m2/n - (m/n)*(m/n);
+    }
+    scores.push([t0,s]); if(s < minS) minS = s;
+  }
+  if(minS >= 1e6) return null;
+  const near = scores.filter(x => x[1] <= minS*1.2 + 1).map(x => x[0]).sort((a,b)=>a-b);
+  return near[(near.length-1)>>1];
+}
+/* 驗證並建立校準表 */
+function tryCal(tg, T){
+  const t0 = refineT0(tg, T); if(t0 === null) return null;
+  const raw = [];
+  for(let k=0;k<=16;k++){
+    const w = windowNorm(t0+k*T+0.25*T, t0+(k+1)*T-0.25*T, null);
+    if(!w) return null; raw.push(w);
+  }
+  const Gref = [0,0,0];
+  for(let k=0;k<16;k++) for(let c=0;c<3;c++) Gref[c] += raw[k][6+c]/16;
+  const Gl = (Gref[0]+Gref[1]+Gref[2])/3;
+  if(Gl < 20) return null;
+  const A=[], B=[], LA=[], LB=[], LK=[];
+  for(let k=0;k<=16;k++){
+    const w = windowNorm(t0+k*T+0.25*T, t0+(k+1)*T-0.25*T, Gref);
+    if(!w) return null;
+    A.push([w[0],w[1],w[2]]); B.push([w[3],w[4],w[5]]);
+    LA.push(mean3(w,0)); LB.push(mean3(w,3)); LK.push(mean3(w,9));
+  }
+  const tol = 0.04*Gl;
+  if(LA[0]-LB[0] < 0.5*Gl) return null;
+  for(let k=0;k<15;k++){
+    if(LB[k+1] < LB[k]-tol) return null;
+    if(k>=1 && LA[k+1] < LA[k]-tol) return null;
+  }
+  if(LB[15]-LB[0] < 0.8*Gl) return null;
+  if(LA[15]-LA[1] < 0.8*Gl) return null;
+  let m = Infinity;
+  for(let k=1;k<16;k++) m = Math.min(m, Math.max(LA[k]-LK[k], LB[k]-LK[k]));
+  const mthr = 0.5*m;
+  if(!(LA[16]-LK[16] < mthr && LB[16]-LK[16] < mthr)) return null;   // 校準後的全黑間隔
+  return {t0, T, Gref, A, B, mthr, Gl};
+}
+function isBlackFrame(f, cal){
+  let al=0, bl=0, kl=0;
+  for(let c=0;c<3;c++){
+    const s = clamp(cal.Gref[c] / Math.max(f[6+c],1), 0.5, 2);
+    al += f[c]*s; bl += f[3+c]*s; kl += f[9+c]*s;
+  }
+  return (al-kl)/3 < cal.mthr && (bl-kl)/3 < cal.mthr;
+}
+const HEXC = '0123456789abcdef';
+function decodeWith(cal, final){
+  const n = frames.length, tLast = frames[n-1].t;
+  let T = cal.T; const t0 = cal.t0;
+  const dataStart = t0 + 17*T;
+  /* 找結束的全黑畫面 */
+  let e = -1;
+  for(let i=lowerBound(dataStart); i<n; i++){
+    if(isBlackFrame(frames[i].f, cal)){
+      let j = i; while(j+1<n && isBlackFrame(frames[j+1].f, cal)) j++;
+      if(j-i >= 1 && frames[j].t - frames[i].t >= 0.3*T){ e = i; break; }
+      i = j;
+    }
+  }
+  let Npk, done = false;
+  if(e > 0){
+    const tEnd = (frames[e-1].t + frames[e].t)/2;
+    Npk = Math.max(0, Math.round((tEnd - t0)/T) - 17);
+    const Tfit = (tEnd - t0) / (17 + Npk);
+    if(Math.abs(Tfit - T) < 0.03*T) T = Tfit;     // 以起點與結束點反推實際封包時間
+    done = true;
+  } else {
+    Npk = Math.max(0, Math.floor((tLast - dataStart)/T - 0.75) + 1);
+  }
+  const nibs = [], flags = [];
+  for(let m=0;m<Npk;m++){
+    const s = t0 + 17*T + m*T;
+    const w = windowNorm(s+0.25*T, s+0.75*T, cal.Gref);
+    if(!w){ nibs.push([0,0,0]); flags.push(2); continue; }
+    const tri = [0,0,0]; let flag = 0;
+    for(let c=0;c<3;c++){
+      const a = w[c], b = w[3+c];
+      let best = Infinity, bi = 0;
+      for(let k=0;k<16;k++){
+        const d = (a-cal.A[k][c])**2 + (b-cal.B[k][c])**2;
+        if(d < best){ best = d; bi = k; }
+      }
+      tri[c] = bi;
+      const dist = Math.sqrt(best);
+      if(dist > 12) flag = Math.max(flag, 2); else if(dist > 8) flag = Math.max(flag, 1);
+      const gr = w[6+c] / cal.Gref[c];
+      if(gr < 0.75 || gr > 1.33) flag = Math.max(flag, 1);      // 灰階區塊漂移過大
+    }
+    nibs.push(tri); flags.push(flag);
+  }
+  const hex = nibs.map(t => HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]).join('');
+  return {state: done ? 'done' : 'rx', done, nibs, flags, hex, T, Npk};
+}
+function analyze(final, msIn){
+  const n = frames.length;
+  if(n < 30) return {state:'wait', msg:'等待訊號…'};
+  const T0 = Math.max(60, msIn || 100);
+  if(calObj) return decodeWith(calObj, final);
+  const dts = []; for(let i=Math.max(1,n-60); i<n; i++) dts.push(frames[i].t - frames[i-1].t);
+  dts.sort((a,b)=>a-b); const dtMed = dts[dts.length>>1] || 33;
+  const tLast = frames[n-1].t;
+  for(let i=1;i<n;i++){
+    if(!isCal0(frames[i].f) || isCal0(frames[i-1].f)) continue;
+    const key = Math.round(frames[i].t/50);
+    if(failed.has(key)) continue;
+    if(tLast < frames[i].t + 17.6*T0) return {state:'cal', msg:'偵測到可能的校準開頭，收集校準資料中…'};
+    const cal = tryCal(frames[i].t - dtMed/2, T0);
+    if(!cal){ failed.add(key); continue; }
+    calObj = cal;
+    return decodeWith(calObj, final);
+  }
+  return {state:'wait', msg:'尚未偵測到 16 段灰階校準。\n請對準色塊，並確認發射端「開始傳送」後才開始接收。'};
+}
+/*ANALYSIS_END*/
+
+/* ============================================================
+   相機與取樣
+   ============================================================ */
+const video = $('v'), ov = $('ov'), octx = ov.getContext('2d');
+const samp = document.createElement('canvas'); samp.width = samp.height = 64;
+const sctx = samp.getContext('2d', {willReadFrequently:true});
+sctx.imageSmoothingQuality = 'high';
+let stream = null, listening = false;
+const roi = {cx:0.5, cy:0.5, size:0.6};
+/* 邏輯區塊(A,B,G,K) → 相機畫面中的實際位置(0=左上,1=右上,2=左下,3=右下) */
+const ROTMAP = {0:[0,1,2,3], 90:[1,3,0,2], 180:[3,2,1,0], 270:[2,0,3,1]};
+
+function clampRoi(){
+  const vw = video.videoWidth||1, vh = video.videoHeight||1;
+  const half = roi.size*Math.min(vw,vh)/2;
+  roi.cx = clamp(roi.cx, half/vw, 1-half/vw);
+  roi.cy = clamp(roi.cy, half/vh, 1-half/vh);
+}
+function sample(){
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if(!vw) return null;
+  clampRoi();
+  const side = roi.size*Math.min(vw,vh);
+  sctx.drawImage(video, roi.cx*vw-side/2, roi.cy*vh-side/2, side, side, 0, 0, 64, 64);
+  const d = sctx.getImageData(0,0,64,64).data;
+  const phys = new Float32Array(12);
+  for(let cell=0;cell<4;cell++){
+    const ox=(cell&1)*32, oy=(cell>>1)*32;
+    let r=0,g=0,b=0,n=0;
+    for(let y=oy+8;y<oy+24;y++) for(let x=ox+8;x<ox+24;x++){
+      const p=(y*64+x)*4; r+=d[p]; g+=d[p+1]; b+=d[p+2]; n++;
+    }
+    phys[cell*3]=r/n; phys[cell*3+1]=g/n; phys[cell*3+2]=b/n;
+  }
+  const map = ROTMAP[$('rot').value], f = new Float32Array(12);
+  for(let L=0;L<4;L++) for(let c=0;c<3;c++) f[L*3+c] = phys[map[L]*3+c];
+  return f;
+}
+let lastLive = 0;
+function onFrame(t){
+  const f = sample();
+  if(!f) return;
+  if(listening){
+    frames.push({t, f});
+    if(frames.length > 8000) frames.splice(0, 2000);
+  }
+  if(t - lastLive > 120){
+    lastLive = t;
+    ['sA','sB','sG','sK'].forEach((id,i)=>{
+      const e = $(id), r=f[i*3]|0, g=f[i*3+1]|0, b=f[i*3+2]|0;
+      e.style.background = `rgb(${r},${g},${b})`;
+      e.textContent = `${r},${g},${b}`;
+    });
+  }
+}
+function loopFrames(){
+  if('requestVideoFrameCallback' in HTMLVideoElement.prototype){
+    const cb = (now, meta) => { onFrame(meta && meta.captureTime ? meta.captureTime : now); video.requestVideoFrameCallback(cb); };
+    video.requestVideoFrameCallback(cb);
+  } else {
+    const cb = now => { onFrame(now); requestAnimationFrame(cb); };
+    requestAnimationFrame(cb);
+  }
+}
+function drawGuide(){
+  const w = ov.clientWidth, h = ov.clientHeight;
+  if(ov.width !== w || ov.height !== h){ ov.width = w; ov.height = h; }
+  octx.clearRect(0,0,w,h);
+  if(video.videoWidth){
+    clampRoi();
+    const sc = w / video.videoWidth;
+    const side = roi.size*Math.min(video.videoWidth, video.videoHeight)*sc;
+    const x = roi.cx*w - side/2, y = roi.cy*h - side/2;
+    octx.strokeStyle = '#3f8'; octx.lineWidth = 2;
+    octx.strokeRect(x,y,side,side);
+    octx.beginPath(); octx.moveTo(x+side/2,y); octx.lineTo(x+side/2,y+side); octx.moveTo(x,y+side/2); octx.lineTo(x+side,y+side/2); octx.stroke();
+    octx.fillStyle = '#3f8'; octx.font = '12px sans-serif';
+    const map = ROTMAP[$('rot').value], names = ['−10','+10','灰階','黑'];
+    for(let L=0;L<4;L++){
+      const cell = map[L];
+      octx.fillText(names[L], x + (cell&1)*side/2 + 4, y + (cell>>1)*side/2 + 14);
+    }
+  }
+  requestAnimationFrame(drawGuide);
+}
+let drag = null;
+ov.addEventListener('pointerdown', e => { drag = {x:e.clientX, y:e.clientY}; ov.setPointerCapture(e.pointerId); });
+ov.addEventListener('pointermove', e => {
+  if(!drag) return;
+  roi.cx += (e.clientX-drag.x)/ov.clientWidth;
+  roi.cy += (e.clientY-drag.y)/ov.clientHeight;
+  drag = {x:e.clientX, y:e.clientY};
+});
+ov.addEventListener('pointerup', () => drag = null);
+$('size').oninput = () => roi.size = $('size').value/100;
+
+$('cam').onclick = async () => {
+  try{
+    stream = await navigator.mediaDevices.getUserMedia({
+      video:{facingMode:{ideal:'environment'}, width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60}}, audio:false});
+    video.srcObject = stream; await video.play();
+    $('cam').textContent = '相機已啟動';
+    $('status').textContent = '相機已啟動。移動取樣框並調整大小，使四個色塊各落在框內四格；下方四個小方塊應與發射端顏色一致。';
+    loopFrames(); drawGuide();
+  }catch(err){
+    $('status').textContent = '無法開啟相機：' + err.message + '\n（需要 https 或 localhost，並允許相機權限）';
+  }
+};
+$('lock').onclick = async () => {
+  if(!stream){ $('status').textContent = '請先啟動相機'; return; }
+  const tr = stream.getVideoTracks()[0];
+  const caps = tr.getCapabilities ? tr.getCapabilities() : {}, st = tr.getSettings ? tr.getSettings() : {};
+  const adv = {}, msg = [];
+  if(caps.exposureMode && caps.exposureMode.includes('manual')){
+    adv.exposureMode = 'manual'; if(st.exposureTime) adv.exposureTime = st.exposureTime; msg.push('曝光：手動');
+  } else msg.push('曝光：此瀏覽器/裝置不支援鎖定');
+  if(caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual')){
+    adv.whiteBalanceMode = 'manual'; if(st.colorTemperature) adv.colorTemperature = st.colorTemperature; msg.push('白平衡：手動');
+  } else msg.push('白平衡：此瀏覽器/裝置不支援鎖定');
+  if(Object.keys(adv).length){ try{ await tr.applyConstraints({advanced:[adv]}); }catch(e){ msg.push('套用失敗：'+e.message); } }
+  msg.push('（不支援時，程式仍會用每個封包的灰階區塊補償曝光漂移）');
+  $('status').textContent = msg.join('\n');
+};
+
+/* ============================================================
+   接收流程
+   ============================================================ */
+function render(res){
+  let s = res.msg || '';
+  if(res.nibs){
+    const bad = res.flags.filter(x=>x===2).length, warn = res.flags.filter(x=>x===1).length;
+    s = (res.done ? '✔ 接收完成\n' : '接收中…\n') +
+        `校準：已完成　封包時間 ≈ ${res.T.toFixed(1)} ms\n` +
+        `封包 ${res.Npk} 個（${res.Npk*3} 個 hex 字元）　信心偏低 ${warn}　疑似錯誤 ${bad}`;
+    $('packets').innerHTML = res.nibs.map((t,i)=>{
+      const cls = res.flags[i]===2 ? 'bad' : res.flags[i]===1 ? 'warn' : '';
+      return `<span class="${cls}">${HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]}</span>`;
+    }).join('');
+    let hex = res.hex; const L = +$('len').value;
+    if(L > 0) hex = hex.slice(0, L);
+    $('hex').value = hex;
+    $('textOut').value = hexToText(hex);
+  }
+  $('status').textContent = s;
+}
+/* 文字解碼規則：hex 每 6 個字元為一個字，尾端用 f 補滿
+   例：259 91f → "25991f" → 去掉尾端 f → 十進位 25991 → U+6587「文」
+   （5 位數補 1 個 f；4 位數補 2 個 f；6 位數不補）*/
+function hexToText(hex){
+  let out = '';
+  for(let i=0; i+6<=hex.length; i+=6){
+    const unit = hex.slice(i, i+6).replace(/f+$/,'');
+    const cp = /^\d+$/.test(unit) ? parseInt(unit,10) : NaN;
+    if(Number.isNaN(cp) || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) out += '�';
+    else out += String.fromCodePoint(cp);
+  }
+  return out;
+}
+let timer = null;
+function startListen(){
+  if(!stream){ $('status').textContent = '請先啟動相機'; return; }
+  frames.length = 0; calObj = null; failed.clear();
+  $('packets').innerHTML = ''; $('hex').value = ''; $('textOut').value = '';
+  listening = true;
+  $('go').textContent = '停止並解碼'; $('go').className = 'stop';
+  $('status').textContent = '監聽中… 請在發射端按「開始傳送」。';
+  timer = setInterval(() => {
+    if(!listening) return;
+    const r = analyze(false, +$('ms').value);
+    render(r);
+    if(r.done) stopListen(false);
+  }, 400);
+}
+function stopListen(final){
+  listening = false; clearInterval(timer);
+  $('go').textContent = '開始接收'; $('go').className = '';
+  if(final){ const r = analyze(true, +$('ms').value); render(r); }
+}
+$('go').onclick = () => listening ? stopListen(true) : startListen();
+$('rst').onclick = () => {
+  stopListen(false);
+  frames.length = 0; calObj = null; failed.clear();
+  $('packets').innerHTML = ''; $('hex').value = ''; $('textOut').value = '';
+  $('status').textContent = '已重置。';
+};
+$('copyText').onclick = async () => {
+  try{ await navigator.clipboard.writeText($('textOut').value); $('status').textContent += '\n已複製文字'; }
+  catch(e){ $('textOut').select(); document.execCommand('copy'); }
+};
+$('copy').onclick = async () => {
+  try{ await navigator.clipboard.writeText($('hex').value); $('status').textContent += '\n已複製'; }
+  catch(e){ $('hex').select(); document.execCommand('copy'); }
+};
+</script>
+</body>
+</html>

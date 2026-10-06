@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>空間差分色碼發射端</title>
+<style>
+  html,body{margin:0;height:100%;background:#0f0f0f;color:#ddd;font-family:system-ui,"Noto Sans TC",sans-serif}
+  body{display:flex;align-items:stretch}
+  #panel{width:320px;padding:16px;box-sizing:border-box;display:flex;flex-direction:column;gap:8px;justify-content:flex-end;overflow:auto}
+  #panel label{font-size:12px;color:#999}
+  input,textarea,button{font-size:16px;padding:6px 8px;border-radius:5px;border:2px solid #555;box-sizing:border-box;width:100%}
+  textarea{resize:vertical;min-height:70px;font-family:monospace}
+  button{background:#2b6;color:#fff;border:0;cursor:pointer}
+  button.stop{background:#c44}
+  button.sec{background:#444}
+  #info{font:12px/1.5 monospace;color:#8c8;white-space:pre-wrap;min-height:80px}
+  #preview{font:13px/1.8 monospace;color:#999;max-height:140px;overflow:auto;word-break:break-all}
+  #preview span{padding:1px 3px;margin:1px;border-radius:3px;display:inline-block}
+  #preview span.cur{background:#2b6;color:#fff}
+  #preview span.done{color:#555}
+  #stage{flex:1;display:flex;align-items:flex-start;justify-content:center;padding:16px}
+  #grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+        width:min(720px,calc(100vh - 32px),calc(100vw - 360px));aspect-ratio:1/1;gap:0}
+  #grid div{width:100%;height:100%}
+  #cA{background:#5a5a5a}#cB{background:#707070}#cG{background:#808080}#cK{background:#000}
+  body.full #panel{display:none}
+  body.full #stage{padding:0;align-items:center}
+  body.full #grid{width:min(100vh,100vw)}
+</style>
+</head>
+<body>
+<div id="panel">
+  <div id="info">待機中</div>
+  <label>封包拆分預覽（每 3 字一個封包）</label>
+  <div id="preview"></div>
+  <label>每個封包顯示時間 (ms)（接收端要設成相同）</label>
+  <input id="ms" type="number" value="100" min="80" step="10">
+  <label><input id="loop" type="checkbox" style="width:auto"> 完成後循環重送（每輪開始都先自動校準）</label>
+  <label>輸入文字（自動轉成下方 hex；每字 = 十進位 Unicode 補 f 到 6 位）</label>
+  <textarea id="plain" spellcheck="false" placeholder="例如：文字加密色碼傳輸系統測試"></textarea>
+  <label>要傳送的 hex（可直接貼上已加密好的結果，也可由上方文字自動產生）</label>
+  <textarea id="txt" spellcheck="false">abc123def456</textarea>
+  <button id="go">開始傳送</button>
+  <button class="sec" id="clr">清空</button>
+  <button class="sec" id="fs">全螢幕（只顯示色塊）</button>
+</div>
+<div id="stage">
+  <div id="grid">
+    <div id="cA"></div>   <!-- 左上：data − 10（溢位） -->
+    <div id="cB"></div>   <!-- 右上：data + 10（溢位） -->
+    <div id="cG"></div>   <!-- 左下：固定灰階 #808080 -->
+    <div id="cK"></div>   <!-- 右下：固定全黑 -->
+  </div>
+</div>
+
+<script>
+/* ============ 協定參數 ============ */
+const DELTA = 10;                              // 差分 ±10
+const GRAY = '#808080';                        // 每個封包固定灰階
+const wrap = x => ((x % 256) + 256) % 256;     // 超過 255 溢位回 0，低於 0 溢位回 255
+const level = n => n * 16;                     // 4bit(0..15) -> 0,16,...,240（在 256 的圓環上等間距）
+const hex2 = v => v.toString(16).padStart(2,'0');
+const rgbHex = (r,g,b) => '#' + hex2(r)+hex2(g)+hex2(b);
+const $ = id => document.getElementById(id);
+const hx = n => n.toString(16);
+
+/* 每個封包 = 3 個 hex 字元 = R,G,B 各 4 bit。
+   畫面：左上 = level−10 、右上 = level+10（皆對 256 取餘）、左下 = #808080 、右下 = 黑
+   時序：16 段灰階校準 (n,n,n) → 1 格全黑間隔 → 資料封包 → 全黑（結束） */
+const CAL = Array.from({length:16}, (_,n) => [n,n,n]);
+
+/* ============ 輸入 hex → 封包 ============ */
+function cleanHex(s){
+  s = s.trim().replace(/^0x/i,'').replace(/[\s:,_-]/g,'');
+  if(!/^[0-9a-fA-F]*$/.test(s)) return null;
+  return s.toLowerCase();
+}
+function buildPackets(hex){
+  const nibs = [...hex].map(c => parseInt(c,16));
+  while(nibs.length % 3) nibs.push(0);   // 補 0 湊滿 3 字
+  const packets = [];
+  for(let i=0;i<nibs.length;i+=3) packets.push(nibs.slice(i,i+3));
+  return packets;
+}
+
+/* ============ 預覽 ============ */
+function renderPreview(packets){
+  const box = $('preview'); box.innerHTML = '';
+  packets.forEach((p,i) => {
+    const sp = document.createElement('span');
+    sp.id = 'pv'+i;
+    sp.textContent = p.map(hx).join('');
+    box.appendChild(sp);
+  });
+}
+function updatePreviewFromInput(){
+  const h = cleanHex($('txt').value);
+  if(h === null){ $('preview').textContent = '含有非 hex 字元（只能 0-9 a-f）'; return; }
+  renderPreview(buildPackets(h));
+}
+$('txt').addEventListener('input', updatePreviewFromInput);
+
+/* ============ 文字 → hex ============
+   每個字 = 十進位 Unicode 碼位，尾端補 f 湊滿 6 位：
+   文 (U+6587 = 25991) → "25991f" → 封包 259 91f
+   5 位數補 1 個 f、4 位數補 2 個 f、6 位數不補；超出 6 位數的碼位改用 65533 (�) */
+function textToHex(text){
+  let out = '';
+  for(const ch of Array.from(text)){
+    let d = String(ch.codePointAt(0));
+    if(d.length > 6) d = '65533';
+    out += d.padEnd(6, 'f');
+  }
+  return out;
+}
+$('plain').addEventListener('input', () => {
+  $('txt').value = textToHex($('plain').value);
+  updatePreviewFromInput();
+});
+
+/* ============ 顯示 ============ */
+function show(n3){
+  const v = n3.map(level);
+  const a = rgbHex(wrap(v[0]-DELTA), wrap(v[1]-DELTA), wrap(v[2]-DELTA));
+  const b = rgbHex(wrap(v[0]+DELTA), wrap(v[1]+DELTA), wrap(v[2]+DELTA));
+  $('cA').style.background = a;
+  $('cB').style.background = b;
+  $('cG').style.background = GRAY;
+  $('cK').style.background = '#000';
+  return {base:rgbHex(...v), a, b};
+}
+function blackScreen(){
+  $('cA').style.background = '#000';
+  $('cB').style.background = '#000';
+  $('cG').style.background = GRAY;
+  $('cK').style.background = '#000';
+}
+
+/* ============ 時序（絕對時間排程，不會累積誤差）============ */
+let running = false;
+
+function buildSteps(packets, ms){
+  const steps = [];
+  CAL.forEach((p,n) => steps.push({dur:ms, apply(){
+    const c = show(p);
+    $('info').textContent = `灰階校準 ${n+1}/16（非封包）\n基準 ${c.base}\n−10  ${c.a}\n+10  ${c.b}\n灰階 ${GRAY}`;
+    clearHL();
+  }}));
+  steps.push({dur:ms, apply(){
+    blackScreen();
+    $('info').textContent = '校準結束間隔（全黑）';
+  }});
+  packets.forEach((p,i) => steps.push({dur:ms, apply(){
+    const c = show(p);
+    $('info').textContent =
+      `資料封包 ${i+1}/${packets.length}  [${p.map(hx).join('')}]\n基準 ${c.base}\n−10  ${c.a}\n+10  ${c.b}\n灰階 ${GRAY}`;
+    highlight(i);
+  }}));
+  steps.push({dur:1500, apply(){
+    blackScreen();
+    $('info').textContent = '傳送結束（全黑）';
+    clearHL(true);
+  }});
+  return steps;
+}
+function clearHL(all){
+  document.querySelectorAll('#preview span').forEach(el=>{
+    el.classList.remove('cur'); if(all) el.classList.add('done'); else el.classList.remove('done');
+  });
+}
+function highlight(i){
+  document.querySelectorAll('#preview span').forEach((el,j)=>{
+    el.classList.toggle('cur', j===i);
+    el.classList.toggle('done', j<i);
+  });
+  const cur = $('pv'+i); if(cur) cur.scrollIntoView({block:'nearest'});
+}
+function run(steps){
+  return new Promise(resolve => {
+    let i = 0, next = performance.now() + 100;
+    function tick(now){
+      if(!running){ resolve(false); return; }
+      if(now >= next){
+        if(i >= steps.length){ resolve(true); return; }
+        steps[i].apply();
+        next += steps[i].dur;
+        i++;
+      }
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(tick);
+  });
+}
+
+async function start(){
+  const hex = cleanHex($('txt').value);
+  if(hex === null || hex.length === 0){ $('info').textContent = '請輸入有效的 hex（0-9 a-f）'; return; }
+  const packets = buildPackets(hex);
+  renderPreview(packets);
+  running = true;
+  $('go').textContent = '停止'; $('go').className = 'stop';
+  const ms = Math.max(80, +$('ms').value || 100);
+  const steps = buildSteps(packets, ms);
+  let ok;
+  do { ok = await run(steps); } while(ok && running && $('loop').checked);
+  if(ok) stop(true);
+}
+function stop(done){
+  running = false;
+  $('go').textContent = '開始傳送'; $('go').className = '';
+  if(done) $('info').textContent += '\n傳送完成';
+  else if(done === undefined) $('info').textContent = '已停止';
+}
+$('go').onclick = () => running ? stop() : start();
+$('clr').onclick = () => {
+  if(running) stop();
+  $('txt').value = '';
+  $('plain').value = '';
+  $('preview').innerHTML = '';
+  $('info').textContent = '待機中';
+  $('cA').style.background = '#5a5a5a';
+  $('cB').style.background = '#707070';
+  $('cG').style.background = GRAY;
+  $('cK').style.background = '#000';
+  $('txt').focus();
+};
+$('fs').onclick = () => {
+  document.body.classList.add('full');
+  document.documentElement.requestFullscreen?.().catch(()=>{});
+};
+document.addEventListener('keydown', e => { if(e.key==='Escape') document.body.classList.remove('full'); });
+document.addEventListener('fullscreenchange', () => { if(!document.fullscreenElement) document.body.classList.remove('full'); });
+updatePreviewFromInput();
+</script>
+</body>
+</html>
