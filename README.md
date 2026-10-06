@@ -7,4 +7,11 @@ meow<br>
 連結 https://wwwbww800.github.io/colortxrx2/<br>
 發射端 https://wwwbww800.github.io/colortxrx2/color_tx_v2.html<br>
 接收端 https://wwwbww800.github.io/colortxrx2/color_rx_v2.html<br>
-
+<br>
+已知問題
+<br>
+環境光干擾 可能導致封包接收錯誤
+<br>
+螢幕gamma曲線導致的輸出顏色不準確
+<br>
+相機白平衡等可能無法鎖定
