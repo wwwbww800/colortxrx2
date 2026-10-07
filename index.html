@@ -4,27 +4,120 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>可見光色碼通訊系統</title>
+    <style>
+        :root {
+            --bg-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #212529;
+            --text-secondary: #495057;
+            --primary-color: #2563eb;
+            --border-color: #e5e7eb;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.7;
+            margin: 0;
+            padding: 40px 20px;
+            display: flex;
+            justify-content: center;
+        }
+
+        .container {
+            max-width: 760px;
+            width: 100%;
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 32px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+        }
+
+        .header-title {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 24px;
+            color: var(--text-color);
+        }
+
+        .section-box {
+            background-color: #f8fafc;
+            border-left: 4px solid var(--primary-color);
+            padding: 16px 20px;
+            margin: 20px 0;
+            border-radius: 0 8px 8px 0;
+            color: var(--text-secondary);
+        }
+
+        .links-group {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+            margin: 24px 0;
+        }
+
+        .btn-link {
+            display: inline-flex;
+            align-items: center;
+            padding: 8px 16px;
+            background-color: #ffffff;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--primary-color);
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 0.95rem;
+            transition: all 0.2s ease;
+        }
+
+        .btn-link:hover {
+            background-color: var(--primary-color);
+            color: #ffffff;
+            border-color: var(--primary-color);
+        }
+
+        .update-box {
+            margin-top: 28px;
+            padding-top: 20px;
+            border-top: 1px solid var(--border-color);
+        }
+
+        .update-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            margin-bottom: 12px;
+        }
+    </style>
 </head>
 <body>
 
-<br>
-一個可見光色碼通訊系統[cite: 1]
-<br>
-<br>
+<div class="container">
+    <div class="header-title">可見光色碼通訊系統</div>
 
-將中文用unicode 轉為十進位後輸出成hex色碼（中文字unicode十進位 為5或6位數 若為5位數則第六位補f） 再將hex做成封包 每個封包傳送3位數 所以一個hex色碼會拆分成2個hex色碼來傳送 <br>解碼時再合併再讓螢幕依照那一個hex色碼（假設#808080） 用空間差分同時顯示兩個顏色 例如把#808080的RRGGBB都減10和加10（十進位） 再讓相機測出那兩個色碼的值（相機曝光和白平衡都固定 螢幕亮度固定） 相機就可以得出兩串色碼 <br>編碼時將 RGB 的數據（超過245讓他溢位 低於10同理） 再把那兩串色碼一個+10一個-10就可以得出原本輸出的hex色碼 套用unicode後就能接收到那串文字<br> 第一次傳輸訊號前先傳輸一個校驗訊號 （16階灰階） 讓發射端和接收端都知道 再用這個來校準<br> 每一個封包（兩個顏色）要同時顯示一個固定的灰階在第三個區塊和一個全黑的黑色在第四區塊 當作接收端每次接收的參考值[cite: 1]
-<br>
-<a href="https://wwwbww800.github.io/colortxrx2/">網頁連結</a>[cite: 1]
-<br>
-<a href="https://wwwbww800.github.io/colortxrx2/color_tx.html">發射端</a>[cite: 1]
-<br>
-<a href="https://wwwbww800.github.io/colortxrx2/color_rx.html">接收端</a>[cite: 1]
-<br><br>
-10/07更新內容<br>
-1. 接收端不再直接用相機讀到的 RGB，改成 n = (X − K) / (G − K)，每個通道分開算。X 是左上或右上區塊，G 是灰階，K 是全黑。<br>
-灰階被當成 1.0，黑色被當成 0。曝光、白平衡、增益變動時，這個比值還是穩定。<br>
-2. 即時 Gamma 曲線<br>
-利用傳送的 16 階灰階校驗訊號，在接收端即時建立螢幕的 Gamma 轉譯曲線[cite: 1]
+    <div class="section-box">
+        將中文用unicode 轉為十進位後輸出成hex色碼（中文字unicode十進位 為5或6位數 若為5位數則第六位補f） 再將hex做成封包 每個封包傳送3位數 所以一個hex色碼會拆分成2個hex色碼來傳送 <br><br>
+        解碼時再合併再讓螢幕依照那一個hex色碼（假設#808080） 用空間差分同時顯示兩個顏色 例如把#808080的RRGGBB都減10和加10（十進位） 再讓相機測出那兩個色碼的值（相機曝光和白平衡都固定 螢幕亮度固定） 相機就可以得出兩串色碼 <br><br>
+        編碼時將 RGB 的數據（超過245讓他溢位 低於10同理） 再把那兩串色碼一個+10一個-10就可以得出原本輸出的hex色碼 套用unicode後就能接收到那串文字<br><br>
+        第一次傳輸訊號前先傳輸一個校驗訊號 （16階灰階） 讓發射端和接收端都知道 再用這個來校準<br><br>
+        每一個封包（兩個顏色）要同時顯示一個固定的灰階在第三個區塊和一個全黑的黑色在第四區塊 當作接收端每次接收的參考值
+    </div>
+
+    <div class="links-group">
+        <a href="https://wwwbww800.github.io/colortxrx2/" class="btn-link">網頁連結</a>
+        <a href="https://wwwbww800.github.io/colortxrx2/color_tx.html" class="btn-link">發射端</a>
+        <a href="https://wwwbww800.github.io/colortxrx2/color_rx.html" class="btn-link">接收端</a>
+    </div>
+
+    <div class="update-box">
+        <div class="update-title">10/07更新內容</div>
+        1. 接收端不再直接用相機讀到的 RGB，改成 n = (X − K) / (G − K)，每個通道分開算。X 是左上或右上區塊，G 是灰階，K 是全黑。<br>
+        灰階被當成 1.0，黑色被當成 0。曝光、白平衡、增益變動時，這個比值還是穩定。<br><br>
+        2. 即時 Gamma 曲線<br>
+        利用傳送的 16 階灰階校驗訊號，在接收端即時建立螢幕的 Gamma 轉譯曲線
+    </div>
+</div>
 
 </body>
 </html>
