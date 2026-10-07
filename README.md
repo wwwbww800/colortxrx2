@@ -9,11 +9,9 @@
 [發射端](https://wwwbww800.github.io/colortxrx2/color_tx.html)
 <br>
 [接收端](https://wwwbww800.github.io/colortxrx2/color_rx.html)
-<br>
-已知問題
-<br>
-環境光干擾 可能導致封包接收錯誤
-<br>
-螢幕gamma曲線導致的輸出顏色不準確
-<br>
-相機白平衡等可能無法鎖定
+<br><br>
+10/07更新內容<br>
+1. 接收端不再直接用相機讀到的 RGB，改成 n = (X − K) / (G − K)，每個通道分開算。X 是左上或右上區塊，G 是灰階，K 是全黑。<br>
+灰階被當成 1.0，黑色被當成 0。曝光、白平衡、增益變動時，這個比值還是穩定。<br>
+2. 即時 Gamma 曲線<br>
+利用傳送的 16 階灰階校驗訊號，在接收端即時建立螢幕的 Gamma 轉譯曲線
