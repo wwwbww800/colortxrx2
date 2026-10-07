@@ -3,181 +3,28 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>可見光色碼通訊系統 (ColorTxRx)</title>
-    <!-- Bootstrap 5 CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <!-- Bootstrap Icons -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css">
-    <style>
-        :root {
-            --primary-color: #2c3e50;
-            --accent-color: #0d6efd;
-        }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background-color: #f8f9fa;
-            color: #333;
-        }
-        .hero-section {
-            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-            color: white;
-            padding: 4rem 0;
-            margin-bottom: 2rem;
-            border-radius: 0 0 1.5rem 1.5rem;
-        }
-        .card-custom {
-            border: none;
-            border-radius: 1rem;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-        .card-custom:hover {
-            transform: translateY(-4px);
-            box-shadow: 0 8px 24px rgba(0,0,0,0.1);
-        }
-        .step-badge {
-            width: 32px;
-            height: 32px;
-            background-color: var(--accent-color);
-            color: white;
-            border-radius: 50%;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            margin-right: 0.5rem;
-        }
-        .code-inline {
-            background-color: #eef2f7;
-            padding: 0.2rem 0.4rem;
-            border-radius: 0.25rem;
-            font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-            color: #d63384;
-        }
-    </style>
+    <title>可見光色碼通訊系統</title>
 </head>
 <body>
 
-    <!-- 頂部 Hero 區塊 -->
-    <header class="hero-section text-center">
-        <div class="container">
-            <h1 class="display-4 fw-bold mb-3"><i class="bi bi-palette2 me-2"></i>可見光色碼通訊系統</h1>
-            <p class="lead mb-0">利用螢幕發光色彩與相機空間差分特性的高穩定性 VLC 通訊架構</p>
-        </div>
-    </header>
+<br>
+一個可見光色碼通訊系統[cite: 1]
+<br>
+<br>
 
-    <div class="container mb-5">
-        
-        <!-- 快速功能導向卡片 -->
-        <div class="row g-4 mb-5">
-            <div class="col-md-6">
-                <div class="card card-custom h-100 p-3">
-                    <div class="card-body d-flex flex-column">
-                        <div class="d-flex align-items-center mb-3">
-                            <i class="bi bi-broadcast fs-1 text-primary me-3"></i>
-                            <div>
-                                <h3 class="card-title h4 mb-0">發射端 (Tx)</h3>
-                                <small class="text-muted">Color Transmitter</small>
-                            </div>
-                        </div>
-                        <p class="card-text text-secondary flex-grow-1">
-                            將輸入的中文字串透過 Unicode 編碼拆解為 Hex 色碼封包，並在螢幕上渲染色區進行光訊號發射。
-                        </p>
-                        <a href="color_tx.html" class="btn btn-primary rounded-pill w-100 mt-2">
-                            <i class="bi bi-box-arrow-up-right me-1"></i> 前往發射端
-                        </a>
-                    </div>
-                </div>
-            </div>
-
-            <div class="col-md-6">
-                <div class="card card-custom h-100 p-3">
-                    <div class="card-body d-flex flex-column">
-                        <div class="d-flex align-items-center mb-3">
-                            <i class="bi bi-camera-video fs-1 text-success me-3"></i>
-                            <div>
-                                <h3 class="card-title h4 mb-0">接收端 (Rx)</h3>
-                                <small class="text-muted">Color Receiver</small>
-                            </div>
-                        </div>
-                        <p class="card-text text-secondary flex-grow-1">
-                            運用鏡頭捕捉螢幕色塊，透過動態比值校準與 Gamma 轉譯進行影像訊號解調並還原文字。
-                        </p>
-                        <a href="color_rx.html" class="btn btn-success rounded-pill w-100 mt-2">
-                            <i class="bi bi-box-arrow-up-right me-1"></i> 前往接收端
-                        </a>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- 10/07 最新更新紀錄 -->
-        <div class="card card-custom mb-5 border-start border-4 border-info">
-            <div class="card-body p-4">
-                <h2 class="h5 card-title text-info mb-3">
-                    <i class="bi bi-stars me-2"></i>10/07 最新更新內容
-                </h2>
-                <ul class="mb-0 text-secondary lh-lg">
-                    <li>
-                        <strong>無因次比值計算：</strong> 接收端不再直接讀取 Raw RGB，改為以 
-                        <span class="code-inline">n = (X - K) / (G - K)</span> 為核心獨立計算每個 RGB 通道[cite: 1]。
-                        <br>
-                        <small class="text-muted">（$X$: 目標區塊、$G$: 參考灰階 [視為 1.0]、$K$: 參考全黑 [視為 0.0]。當相機曝光、白平衡或增益變動時，此比值能保持高度穩定[cite: 1]。）</small>
-                    </li>
-                    <li>
-                        <strong>即時 Gamma 曲線建立：</strong> 利用傳輸前先送出的 16 階灰階校驗訊號，於接收端即時建立該螢幕的動態 Gamma 轉譯曲線[cite: 1]。
-                    </li>
-                </ul>
-            </div>
-        </div>
-
-        <!-- 系統原理說明區塊 -->
-        <div class="card card-custom p-4 mb-4">
-            <h2 class="h4 mb-4"><i class="bi bi-gear-wide-connected me-2"></i>系統運作原理</h2>
-            
-            <div class="row g-4">
-                <div class="col-md-4">
-                    <div class="p-3 bg-light rounded-3 h-100">
-                        <h3 class="h6 text-primary fw-bold mb-2">
-                            <span class="step-badge">1</span>編碼與封包 (Encoding)
-                        </h3>
-                        <p class="small text-secondary mb-0">
-                            將中文轉為 Unicode 十進位數字（5或6位數，5位補 <span class="code-inline">f</span>）[cite: 1]。轉換為 Hex 色碼後切分為 2 個色碼封包（每個封包傳送 3 位數）[cite: 1]。
-                        </p>
-                    </div>
-                </div>
-
-                <div class="col-md-4">
-                    <div class="p-3 bg-light rounded-3 h-100">
-                        <h3 class="h6 text-primary fw-bold mb-2">
-                            <span class="step-badge">2</span>空間差分傳送 (Spatial Differential)
-                        </h3>
-                        <p class="small text-secondary mb-0">
-                            假設原始色碼為 <span class="code-inline">#808080</span>，利用空間差分同時顯示兩色（RRGGBB 分別 +10 與 -10）[cite: 1]。同時附帶第三區塊固定灰階與第四區塊全黑基準[cite: 1]。
-                        </p>
-                    </div>
-                </div>
-
-                <div class="col-md-4">
-                    <div class="p-3 bg-light rounded-3 h-100">
-                        <h3 class="h6 text-primary fw-bold mb-2">
-                            <span class="step-badge">3</span>訊號解調與校準 (Decoding & Calibration)
-                        </h3>
-                        <p class="small text-secondary mb-0">
-                            相機在固定曝光白平衡下擷取色塊，以全黑與固定灰階當作參考基準點進行色彩與 Gamma 修正，解出原始色碼並轉回 Unicode 文字[cite: 1]。
-                        </p>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-    </div>
-
-    <footer class="text-center text-muted py-4 border-top">
-        <div class="container">
-            <small>可見光色碼通訊系統 &copy; ColorTxRx Project</small>
-        </div>
-    </footer>
+將中文用unicode 轉為十進位後輸出成hex色碼（中文字unicode十進位 為5或6位數 若為5位數則第六位補f） 再將hex做成封包 每個封包傳送3位數 所以一個hex色碼會拆分成2個hex色碼來傳送 <br>解碼時再合併再讓螢幕依照那一個hex色碼（假設#808080） 用空間差分同時顯示兩個顏色 例如把#808080的RRGGBB都減10和加10（十進位） 再讓相機測出那兩個色碼的值（相機曝光和白平衡都固定 螢幕亮度固定） 相機就可以得出兩串色碼 <br>編碼時將 RGB 的數據（超過245讓他溢位 低於10同理） 再把那兩串色碼一個+10一個-10就可以得出原本輸出的hex色碼 套用unicode後就能接收到那串文字<br> 第一次傳輸訊號前先傳輸一個校驗訊號 （16階灰階） 讓發射端和接收端都知道 再用這個來校準<br> 每一個封包（兩個顏色）要同時顯示一個固定的灰階在第三個區塊和一個全黑的黑色在第四區塊 當作接收端每次接收的參考值[cite: 1]
+<br>
+<a href="https://wwwbww800.github.io/colortxrx2/">網頁連結</a>[cite: 1]
+<br>
+<a href="https://wwwbww800.github.io/colortxrx2/color_tx.html">發射端</a>[cite: 1]
+<br>
+<a href="https://wwwbww800.github.io/colortxrx2/color_rx.html">接收端</a>[cite: 1]
+<br><br>
+10/07更新內容<br>
+1. 接收端不再直接用相機讀到的 RGB，改成 n = (X − K) / (G − K)，每個通道分開算。X 是左上或右上區塊，G 是灰階，K 是全黑。<br>
+灰階被當成 1.0，黑色被當成 0。曝光、白平衡、增益變動時，這個比值還是穩定。<br>
+2. 即時 Gamma 曲線<br>
+利用傳送的 16 階灰階校驗訊號，在接收端即時建立螢幕的 Gamma 轉譯曲線[cite: 1]
 
 </body>
 </html>
