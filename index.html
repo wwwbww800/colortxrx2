@@ -6,12 +6,15 @@
     <title>可見光色碼通訊系統</title>
     <style>
         :root {
-            --bg-color: #f8f9fa;
-            --card-bg: #ffffff;
-            --text-color: #212529;
-            --text-secondary: #495057;
-            --primary-color: #2563eb;
-            --border-color: #e5e7eb;
+            --bg-color: #0f172a;
+            --card-bg: #1e293b;
+            --section-bg: #0f172a;
+            --text-color: #f8fafc;
+            --text-secondary: #cbd5e1;
+            --primary-color: #3b82f6;
+            --border-color: #334155;
+            --btn-bg: #1e293b;
+            --btn-hover-bg: #2563eb;
         }
 
         body {
@@ -32,7 +35,7 @@
             border: 1px solid var(--border-color);
             border-radius: 12px;
             padding: 32px;
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
         }
 
         .header-title {
@@ -43,7 +46,7 @@
         }
 
         .section-box {
-            background-color: #f8fafc;
+            background-color: var(--section-bg);
             border-left: 4px solid var(--primary-color);
             padding: 16px 20px;
             margin: 20px 0;
@@ -62,7 +65,7 @@
             display: inline-flex;
             align-items: center;
             padding: 8px 16px;
-            background-color: #ffffff;
+            background-color: var(--btn-bg);
             border: 1px solid var(--border-color);
             border-radius: 6px;
             color: var(--primary-color);
@@ -73,21 +76,23 @@
         }
 
         .btn-link:hover {
-            background-color: var(--primary-color);
+            background-color: var(--btn-hover-bg);
             color: #ffffff;
-            border-color: var(--primary-color);
+            border-color: var(--btn-hover-bg);
         }
 
         .update-box {
             margin-top: 28px;
             padding-top: 20px;
             border-top: 1px solid var(--border-color);
+            color: var(--text-secondary);
         }
 
         .update-title {
             font-size: 1.1rem;
             font-weight: 600;
             margin-bottom: 12px;
+            color: var(--text-color);
         }
     </style>
 </head>
@@ -120,8 +125,7 @@
         一個 RS 符號是 12 bit，剛好對應一個封包（3 個 hex 字元）。封包任一通道讀錯，只算一個符號錯誤<br>
         傳送順序是：16 階灰階校準、標頭、資料、結束黑畫面。標頭 23 個封包，內含資料符號數、校驗數、補 0 數，自己有 20 個校驗。資料含 CRC-24 和校驗<br>
         發射端新增「校驗強度」選單，預設 100%（校驗封包數等於資料封包數），可選 25% 到 300%，最少 16 個校驗封包<br>
-        接收端畫面會顯示修正了幾個封包，被修正的封包標成藍底，也會顯示標頭、CRC、校驗的位置<br>
-    
+        接收端畫面會顯示修正了幾個封包，被修正的封包標成藍底，也會顯示標頭、CRC、校驗的位置
     </div>
 </div>
 
