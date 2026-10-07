@@ -105,17 +105,23 @@
     </div>
 
     <div class="links-group">
-        <a href="https://wwwbww800.github.io/colortxrx2/" class="btn-link">網頁連結</a>
+        <a href="https://wwwbww800.github.io/colortxrx2/" class="btn-link">Github Pages連結</a>
         <a href="https://wwwbww800.github.io/colortxrx2/color_tx.html" class="btn-link">發射端</a>
         <a href="https://wwwbww800.github.io/colortxrx2/color_rx.html" class="btn-link">接收端</a>
     </div>
 
     <div class="update-box">
         <div class="update-title">10/07更新內容</div>
-        1. 接收端不再直接用相機讀到的 RGB，改成 n = (X − K) / (G − K)，每個通道分開算。X 是左上或右上區塊，G 是灰階，K 是全黑。<br>
-        灰階被當成 1.0，黑色被當成 0。曝光、白平衡、增益變動時，這個比值還是穩定。<br><br>
+        1. 接收端不再直接用相機讀到的 RGB，改成 n = (X − K) / (G − K)，每個通道分開算。X 是左上或右上區塊，G 是灰階，K 是全黑<br>
+        灰階被當成 1.0，黑色被當成 0。曝光、白平衡、增益變動時，這個比值還是穩定<br><br>
         2. 即時 Gamma 曲線<br>
-        利用傳送的 16 階灰階校驗訊號，在接收端即時建立螢幕的 Gamma 轉譯曲線
+        利用傳送的 16 階灰階校驗訊號，在接收端即時建立螢幕的 Gamma 轉譯曲線<br><br>
+        3. 里德-所羅門碼校驗<br>
+        一個 RS 符號是 12 bit，剛好對應一個封包（3 個 hex 字元）。封包任一通道讀錯，只算一個符號錯誤<br>
+        傳送順序是：16 階灰階校準、標頭、資料、結束黑畫面。標頭 23 個封包，內含資料符號數、校驗數、補 0 數，自己有 20 個校驗。資料含 CRC-24 和校驗<br>
+        發射端新增「校驗強度」選單，預設 100%（校驗封包數等於資料封包數），可選 25% 到 300%，最少 16 個校驗封包<br>
+        接收端畫面會顯示修正了幾個封包，被修正的封包標成藍底，也會顯示標頭、CRC、校驗的位置<br>
+    
     </div>
 </div>
 
