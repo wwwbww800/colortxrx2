@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>空間差分色碼接收端 v3</title>
+<title>空間差分色碼接收端（Reed-Solomon）</title>
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;background:#0f0f0f;color:#ddd;font-family:system-ui,"Noto Sans TC",sans-serif}
@@ -26,6 +26,10 @@
   #packets span{padding:1px 4px;margin:1px;border-radius:3px;display:inline-block;background:#1f2a22;color:#cfc}
   #packets span.warn{background:#5a4a14;color:#fe9}
   #packets span.bad{background:#6a1f1f;color:#fcc}
+  #packets span.fix{background:#1c3a5a;color:#9cf;text-decoration:underline}
+  #packets span.hdr{opacity:.55;border-bottom:2px solid #c93}
+  #packets span.crc{border-bottom:2px solid #6ad}
+  #packets span.par{opacity:.55;font-style:italic}
   textarea{font-family:monospace;min-height:90px;resize:vertical}
   small{color:#888}
   #curve{width:100%;height:auto;border:1px solid #333;border-radius:6px;background:#161616}
@@ -68,7 +72,7 @@
   <label>由 16 階灰階校準即時建立的 Gamma 曲線（橫軸 = 螢幕送出值 0–255，縱軸 = 相對灰階 #808080 的響應；實線 = 左上區塊、虛線 = 右上區塊、點 = 實測）</label>
   <canvas id="curve" width="640" height="220"></canvas>
 
-  <label>解碼出的封包（橘 = 信心偏低，紅 = 疑似錯誤）</label>
+  <label>解碼出的封包（橘 = 信心偏低，紅 = 疑似錯誤，藍底底線 = 已由 Reed-Solomon 修正；橘底線 = 標頭，藍底線 = CRC，斜體 = 校驗）</label>
   <div id="packets"></div>
   <label>hex 輸出</label>
   <textarea id="hex" readonly></textarea>
@@ -87,6 +91,169 @@ const $ = id => document.getElementById(id);
    每個 frame：{t: 時間(ms), f: Float32Array(12)}
    f 的排列 = 邏輯區塊 A(左上 −10) 0..2、B(右上 +10) 3..5、G(左下 灰階) 6..8、K(右下 黑) 9..11，各為 R,G,B
    ============================================================ */
+/*RS_START*/
+/* ============================================================
+   Reed-Solomon over GF(2^12)：一個符號 = 12 bit = 一個封包（3 個 hex 字元）
+   · 本原多項式 x^12 + x^6 + x^4 + x + 1 (0x1053)，根 α^0 … α^(nsym−1)
+   · 系統碼：資料在前、校驗在後；codeword 長度 n ≤ 4095
+   · 解碼支援「錯誤 + 抹除」：2·錯誤 + 抹除 ≤ nsym（抹除 = 已知位置不可靠的封包）
+   ============================================================ */
+const RS = (() => {
+  const SIZE = 4096, ORDER = 4095, PRIM = 0x1053;
+  const EXP = new Uint16Array(ORDER * 2), LOG = new Uint16Array(SIZE);
+  (function(){
+    let x = 1;
+    for(let i=0;i<ORDER;i++){ EXP[i] = x; LOG[x] = i; x <<= 1; if(x & SIZE) x ^= PRIM; }
+    for(let i=ORDER;i<ORDER*2;i++) EXP[i] = EXP[i-ORDER];
+  })();
+  const mul = (a,b) => (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]];
+  const div = (a,b) => a === 0 ? 0 : EXP[LOG[a] + ORDER - LOG[b]];
+  const alpha = n => EXP[((n % ORDER) + ORDER) % ORDER];
+
+  /* 多項式（低次在前） */
+  function pmul(a,b){
+    const r = new Array(a.length + b.length - 1).fill(0);
+    for(let i=0;i<a.length;i++){ if(!a[i]) continue; for(let j=0;j<b.length;j++) r[i+j] ^= mul(a[i], b[j]); }
+    return r;
+  }
+  function peval(p, x){            // 低次在前
+    let acc = 0;
+    for(let i=p.length-1;i>=0;i--) acc = mul(acc, x) ^ p[i];
+    return acc;
+  }
+  const genCache = new Map();
+  function generator(nsym){        // 回傳「高次在前」，首項為 1
+    if(genCache.has(nsym)) return genCache.get(nsym);
+    let g = [1];
+    for(let i=0;i<nsym;i++) g = pmul(g, [alpha(i), 1]);
+    const gh = g.slice().reverse();
+    genCache.set(nsym, gh);
+    return gh;
+  }
+  /* 編碼：msg 為符號陣列（高次在前），回傳 parity（長度 nsym） */
+  function parity(msg, nsym){
+    const gh = generator(nsym), rem = new Array(nsym).fill(0);
+    for(let i=0;i<msg.length;i++){
+      const fb = msg[i] ^ rem[0];
+      for(let j=0;j<nsym;j++){
+        rem[j] = (j+1 < nsym ? rem[j+1] : 0) ^ (fb ? mul(fb, gh[j+1]) : 0);
+      }
+    }
+    return rem;
+  }
+  const encode = (msg, nsym) => msg.concat(parity(msg, nsym));
+
+  function syndromes(c, nsym){
+    const s = new Array(nsym).fill(0);
+    for(let j=0;j<nsym;j++){
+      const x = alpha(j); let acc = 0;
+      for(let i=0;i<c.length;i++) acc = mul(acc, x) ^ c[i];
+      s[j] = acc;
+    }
+    return s;
+  }
+  /* 解碼：recv = 收到的符號（高次在前），erasures = 抹除位置（陣列索引）
+     回傳 {ok, data(更正後 codeword), nErr, nEra, errPos} */
+  function decode(recv, nsym, erasures){
+    const n = recv.length, c = recv.slice();
+    erasures = Array.from(new Set(erasures || [])).filter(i => i >= 0 && i < n);
+    const fail = () => ({ok:false, data:recv.slice(), nErr:0, nEra:erasures.length, errPos:[]});
+    if(n > ORDER || nsym < 1 || nsym >= n) return fail();
+    const syn = syndromes(c, nsym);
+    if(syn.every(v => v === 0)) return {ok:true, data:c, nErr:0, nEra:0, errPos:[]};
+    const rho = erasures.length;
+    if(rho > nsym) return fail();
+    const degOf = i => n - 1 - i;
+    let gamma = [1];
+    for(const e of erasures) gamma = pmul(gamma, [1, alpha(degOf(e))]);
+    let xi = pmul(syn, gamma).slice(0, nsym);
+    while(xi.length < nsym) xi.push(0);
+    const T = xi.slice(rho);
+    /* Berlekamp–Massey（在 Forney 修正後的症狀上找「錯誤」定位多項式） */
+    let C = [1], B = [1], L = 0, m = 1, b = 1;
+    for(let i=0;i<T.length;i++){
+      let d = T[i];
+      for(let j=1;j<=L;j++) if(j < C.length) d ^= mul(C[j], T[i-j]);
+      if(d === 0){ m++; continue; }
+      const coef = div(d, b), Cn = C.slice();
+      while(Cn.length < B.length + m) Cn.push(0);
+      for(let j=0;j<B.length;j++) Cn[j+m] ^= mul(coef, B[j]);
+      if(2*L <= i){ B = C; L = i + 1 - L; b = d; m = 1; } else m++;
+      C = Cn;
+    }
+    while(C.length > 1 && C[C.length-1] === 0) C.pop();
+    const nu = C.length - 1;
+    if(nu !== L || 2*nu + rho > nsym) return fail();
+    /* Chien 搜尋：Λ_e(α^-d) = 0 的 d 就是錯誤的次數位置 */
+    const errDeg = [];
+    for(let d=0; d<n; d++){
+      if(peval(C, alpha(-d)) === 0) errDeg.push(d);
+    }
+    if(errDeg.length !== nu) return fail();
+    const eraDeg = erasures.map(degOf);
+    for(const d of errDeg) if(eraDeg.includes(d)) return fail();
+    const allDeg = eraDeg.concat(errDeg);
+    const lam = pmul(C, gamma);
+    let omega = pmul(syn, lam).slice(0, nsym);
+    const dlam = new Array(Math.max(lam.length - 1, 1)).fill(0);   // 形式導數（特徵 2：只剩奇次項）
+    for(let i=1;i<lam.length;i+=2) dlam[i-1] = lam[i];
+    for(const d of allDeg){
+      const xinv = alpha(-d), X = alpha(d);
+      const den = peval(dlam, xinv);
+      if(den === 0) return fail();
+      const mag = mul(X, div(peval(omega, xinv), den));   // fcr = 0
+      c[n-1-d] ^= mag;
+    }
+    if(!syndromes(c, nsym).every(v => v === 0)) return fail();
+    return {ok:true, data:c, nErr:nu, nEra:rho, errPos:errDeg.map(d => n-1-d)};
+  }
+
+  /* CRC-24（poly 0x864CFB），逐位元處理每個 12 bit 符號 → 回傳 2 個符號 */
+  function crc24(syms){
+    let crc = 0xB704CE;
+    for(const s of syms){
+      for(let b=11;b>=0;b--){
+        const bit = (s >> b) & 1;
+        const top = (crc >> 23) & 1;
+        crc = (crc << 1) & 0xFFFFFF;
+        if(top ^ bit) crc ^= 0x864CFB;
+      }
+    }
+    return [(crc >> 12) & 0xFFF, crc & 0xFFF];
+  }
+  return {encode, parity, decode, crc24, EXP, LOG, SIZE, ORDER};
+})();
+
+/* ============================================================
+   訊框格式
+   [標頭 codeword：3 個資料符號 + HDR_NSYM 個校驗]  [資料 codeword：CRC24(2) + 酬載 + 校驗]
+   標頭資料符號：h0 = (0xA5<<4)|補0數 、h1 = K（資料符號數，含 CRC 的 2 個）、h2 = nsym
+   ============================================================ */
+const HDR_NSYM = 20, HDR_N = 3 + HDR_NSYM, HDR_MAGIC = 0xA5, MIN_NSYM = 16;
+function rsParityFor(K, ratio){ return Math.max(MIN_NSYM, Math.ceil(K * ratio)); }
+/* hex 字串 → 酬載符號（每 3 個 hex 一個符號，不足補 0）與補 0 數 */
+function hexToSyms(hex){
+  const pad = (3 - hex.length % 3) % 3;
+  const h = hex + '0'.repeat(pad), syms = [];
+  for(let i=0;i<h.length;i+=3) syms.push(parseInt(h.slice(i,i+3), 16));
+  return {syms, pad};
+}
+function symsToHex(syms){ return syms.map(s => s.toString(16).padStart(3,'0')).join(''); }
+/* 建立整個訊框；回傳 {symbols, kinds, K, nsym, pad, nTotal} 或 {error} */
+function buildFrame(hex, ratio){
+  const {syms, pad} = hexToSyms(hex);
+  const msg = RS.crc24(syms).concat(syms), K = msg.length;
+  let nsym = rsParityFor(K, ratio);
+  if(K + nsym > RS.ORDER) nsym = RS.ORDER - K;
+  if(nsym < 8) return {error:'訊息太長：資料符號 ' + K + ' 個，超過 Reed-Solomon 上限（4095 個符號含校驗）'};
+  const hdr = RS.encode([(HDR_MAGIC << 4) | pad, K, nsym], HDR_NSYM);
+  const body = RS.encode(msg, nsym);
+  const symbols = hdr.concat(body);
+  const kinds = [].concat(new Array(HDR_N).fill('hdr'), new Array(2).fill('crc'), new Array(syms.length).fill('dat'), new Array(nsym).fill('par'));
+  return {symbols, kinds, K, nsym, pad, nTotal: symbols.length};
+}
+/*RS_END*/
+
 /*ANALYSIS_START*/
 let frames = [], calObj = null;
 const failed = new Set();
@@ -271,7 +438,7 @@ function tryCal(tg, T){
     LA.push(mean3(cells[k].n,0));   LB.push(mean3(cells[k].n,3));
     LAb.push(mean3(cells[k].nb,0)); LBb.push(mean3(cells[k].nb,3));
   }
-  const tol = 0.06;
+  const tol = 0.10;
   if(LA[0]-LB[0] < 0.5) return null;
   for(let k=0;k<15;k++){
     if(LB[k+1] < LB[k]-tol) return null;
@@ -321,40 +488,14 @@ function isBlackFrame(f, cal){
   }
   return (al/3) < cal.blackThr && (bl/3) < cal.blackThr;
 }
-function decodeWith(cal, final){
-  const n = frames.length, tLast = frames[n-1].t;
-  let T = cal.T; const t0 = cal.t0;
-  const dataStart = t0 + 17*T;
-  /* 找結束的全黑畫面：持續 ≥ 3 個封包時間，且其中 ≥ 85% 的 frame 為黑 */
-  const i0 = lowerBound(dataStart);
-  const pre = new Int32Array(n+1), isB = new Uint8Array(n);
-  for(let i=0;i<n;i++){
-    isB[i] = (i >= i0 && isBlackFrame(frames[i].f, cal)) ? 1 : 0;
-    pre[i+1] = pre[i] + isB[i];
-  }
-  let e = -1;
-  for(let i=Math.max(i0,1); i<n; i++){
-    if(!isB[i]) continue;
-    const j = lowerBound(frames[i].t + 3*T);
-    if(j >= n) break;
-    if(pre[j]-pre[i] >= 0.85*(j-i)){ e = i; break; }
-  }
-  let Npk, done = false;
-  if(e > 0){
-    const tEnd = (frames[e-1].t + frames[e].t)/2;
-    Npk = Math.max(0, Math.round((tEnd - t0)/T) - 17);
-    const Tfit = (tEnd - t0) / (17 + Npk);
-    if(Math.abs(Tfit - T) < 0.03*T) T = Tfit;     // 以起點與結束點反推實際封包時間
-    done = true;
-  } else {
-    Npk = Math.max(0, Math.floor((tLast - dataStart)/T - 0.75) + 1);
-  }
-  const nibs = [], flags = [];
-  for(let m=0;m<Npk;m++){
-    const s = t0 + 17*T + m*T;
+/* 讀取第 from…to−1 個封包（0 = 第一個標頭封包）→ 符號、旗標與「可疑度」分數 */
+function readPackets(cal, tStart, T, from, to){
+  const nibs = [], syms = [], flags = [], scores = [];
+  for(let m=from;m<to;m++){
+    const s = tStart + m*T;
     const w = windowNorm(s+0.25*T, s+0.75*T, cal.pad);
-    if(!w){ nibs.push([0,0,0]); flags.push(2); continue; }
-    const tri = [0,0,0]; let flag = 0;
+    if(!w){ nibs.push([0,0,0]); syms.push(0); flags.push(2); scores.push(9); continue; }
+    const tri = [0,0,0]; let flag = 0, sc = 0;
     for(let c=0;c<3;c++){
       const a = w.n[c], b = w.n[3+c];
       /* 在歸一響應空間找最近的等級（雜訊在此空間近似均勻） */
@@ -366,20 +507,163 @@ function decodeWith(cal, final){
       tri[c] = bi;
       const ratio = Math.sqrt(best) / Math.max(cal.DN[bi][c], 1e-6);   // 離最近等級的距離 / 與鄰近等級的間距
       if(ratio > 0.45) flag = Math.max(flag, 2); else if(ratio > 0.30) flag = Math.max(flag, 1);
+      sc = Math.max(sc, ratio/0.45);
       /* ±10 差分驗證：經反曲線回推螢幕送出值後，右上 − 左上 應 = +20（對 256 取餘） */
       const sa = invCurve(cal.cA[c], a), sb = invCurve(cal.cB[c], b);
       let diff = sb - sa; diff = wrap256(diff + 128) - 128;
       const sla = Math.max(slopeAt(cal.cA[c], sa), 0.0015), slb = Math.max(slopeAt(cal.cB[c], sb), 0.0015);
       const z = Math.abs(diff - 20) / (cal.sigmaN * Math.hypot(1/sla, 1/slb));
       if(z > 6) flag = Math.max(flag, 2); else if(z > 3.5) flag = Math.max(flag, 1);
+      sc = Math.max(sc, z/6);
       /* 每個封包的灰階/黑區塊：曝光或白平衡偏離校準時的程度 */
       const gr = w.gk[c] / cal.gk[c];
-      if(gr < 0.7 || gr > 1.43) flag = Math.max(flag, 1);
+      if(gr < 0.7 || gr > 1.43){ flag = Math.max(flag, 1); sc = Math.max(sc, 0.5); }
     }
-    nibs.push(tri); flags.push(flag);
+    nibs.push(tri); syms.push((tri[0]<<8) | (tri[1]<<4) | tri[2]); flags.push(flag); scores.push(sc);
   }
-  const hex = nibs.map(t => HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]).join('');
-  return {state: done ? 'done' : 'rx', done, nibs, flags, hex, T, Npk, cal};
+  return {nibs, syms, flags, scores};
+}
+
+/* ============================================================
+   Reed-Solomon 軟判決解碼
+   把「最可疑」的 e 個封包當成抹除（位置已知，只花 1 份校驗），其餘當作可能的錯誤（花 2 份）。
+   依序嘗試 e = 紅色封包數、紅+橘封包數、0，再由小到大逐步增加到 nsym，
+   第一個通過 accept()（CRC 或標頭檢查）的結果就採用。
+   ============================================================ */
+function softRS(syms, scores, flags, nsym, accept, budgetMs){
+  const n = syms.length;
+  const key = i => flags[i]*10 + scores[i];
+  const order = Array.from({length:n}, (_,i) => i).sort((a,b) => key(b) - key(a));
+  const nRed = flags.filter(f => f === 2).length, nFlag = flags.filter(f => f >= 1).length;
+  const counts = [];
+  const add = e => { if(e >= 0 && e <= nsym && e < n && !counts.includes(e)) counts.push(e); };
+  add(nRed); add(nFlag); add(0);
+  const step = Math.max(1, Math.floor(nsym/32));
+  for(let e=step; e<=nsym; e+=step) add(e);
+  add(nsym);
+  const t0 = Date.now();
+  for(const e of counts){
+    const eras = order.slice(0, e);
+    const r = RS.decode(syms, nsym, eras);
+    if(r.ok && accept(r.data)) return {data:r.data, nErr:r.nErr, nEra:e, tried:counts.indexOf(e)+1};
+    if(Date.now() - t0 > budgetMs) break;
+  }
+  return null;
+}
+const crcOk = (cw, K) => { const c = RS.crc24(cw.slice(2, K)); return c[0] === cw[0] && c[1] === cw[1]; };
+
+/* 讀完的封包 → 標頭 → 資料。complete = 是否已收完（缺的封包當作抹除） */
+function rsProcess(pk, complete, guess){
+  const out = {hdr:null, data:null, stage:'wait'};
+  const n = pk.syms.length;
+  if(n < HDR_N) return out;
+  const h = softRS(pk.syms.slice(0,HDR_N), pk.scores.slice(0,HDR_N), pk.flags.slice(0,HDR_N), HDR_NSYM,
+    cw => (cw[0] >> 4) === HDR_MAGIC && (cw[0] & 15) <= 2 && cw[1] >= 3 && cw[2] >= 8 && cw[1] + cw[2] <= RS.ORDER, 1500);
+  let K, nsym, pad, nTotal;
+  if(h){
+    K = h.data[1]; nsym = h.data[2]; pad = h.data[0] & 15; nTotal = HDR_N + K + nsym;
+    out.hdr = {ok:true, K, nsym, pad, nTotal, nErr:h.nErr, nEra:h.nEra};
+  } else {
+    /* 標頭救不回來：由「收到的封包總數」反推可能的 (K, nsym)（發射端的校驗強度只有幾個預設值），
+       逐一嘗試，由資料的 CRC-24 判定哪一組正確。補 0 數無從得知，假設 0（多出的 0 不影響文字）。 */
+    out.hdr = {ok:false};
+    if(!complete || !guess){ out.stage = 'hdr-fail'; return out; }
+    const nCw0 = n - HDR_N, seen = new Set();
+    for(const dn of [0, -1, 1, -2, 2]){
+      const nCw = nCw0 + dn;
+      for(const ratio of [1, 0.5, 2, 0.25, 3]){
+        for(let k=3;k<nCw;k++){
+          if(k + rsParityFor(k, ratio) !== nCw) continue;
+          const key = k + ':' + (nCw-k); if(seen.has(key)) continue; seen.add(key);
+          const syms = pk.syms.slice(HDR_N, HDR_N + nCw), scores = pk.scores.slice(HDR_N, HDR_N + nCw), flags = pk.flags.slice(HDR_N, HDR_N + nCw);
+          while(syms.length < nCw){ syms.push(0); scores.push(9); flags.push(2); }
+          const r = softRS(syms, scores, flags, nCw - k, cw => crcOk(cw, k), 1500);
+          if(r){
+            const fixed = [];
+            for(let i=0;i<syms.length;i++) if(r.data[i] !== syms[i]) fixed.push(HDR_N + i);
+            out.hdr = {ok:false, guessed:true, K:k, nsym:nCw-k, pad:0, nTotal:HDR_N+nCw};
+            out.data = {ok:true, hex:symsToHex(r.data.slice(2, k)), nErr:r.nErr, nEra:r.nEra, fixed, tried:r.tried};
+            out.stage = 'ok';
+            return out;
+          }
+        }
+      }
+    }
+    out.stage = 'hdr-fail'; return out;
+  }
+  if(n < nTotal && !complete){ out.stage = 'partial'; return out; }
+  const syms = pk.syms.slice(HDR_N, nTotal), scores = pk.scores.slice(HDR_N, nTotal), flags = pk.flags.slice(HDR_N, nTotal);
+  const have = syms.length;
+  while(syms.length < K + nsym){ syms.push(0); scores.push(9); flags.push(2); }
+  out.missing = K + nsym - have;
+  const r = softRS(syms, scores, flags, nsym, cw => crcOk(cw, K), 6000);
+  if(!r){ out.stage = 'data-fail'; return out; }
+  const fixed = [];
+  for(let i=0;i<syms.length;i++) if(r.data[i] !== syms[i] && i < have) fixed.push(HDR_N + i);
+  let hex = symsToHex(r.data.slice(2, K));
+  if(pad) hex = hex.slice(0, hex.length - pad);
+  out.data = {ok:true, hex, nErr:r.nErr, nEra:r.nEra, fixed, tried:r.tried};
+  out.stage = 'ok';
+  return out;
+}
+
+function decodeWith(cal, final){
+  const n = frames.length, tLast = frames[n-1].t;
+  const T0 = cal.T, tS = cal.t0 + 17*T0;          // 第 0 個封包（標頭第一個）的起點
+  /* 找結束的全黑畫面：持續 ≥ 3 個封包時間，且其中 ≥ 85% 的 frame 為黑 */
+  const i0 = lowerBound(tS);
+  const pre = new Int32Array(n+1), isB = new Uint8Array(n);
+  for(let i=0;i<n;i++){
+    isB[i] = (i >= i0 && isBlackFrame(frames[i].f, cal)) ? 1 : 0;
+    pre[i+1] = pre[i] + isB[i];
+  }
+  let e = -1;
+  for(let i=Math.max(i0,1); i<n; i++){
+    if(!isB[i]) continue;
+    const j = lowerBound(frames[i].t + 3*T0);
+    if(j >= n) break;
+    if(pre[j]-pre[i] >= 0.85*(j-i)){ e = i; break; }
+  }
+  const tEnd = e > 0 ? (frames[e-1].t + frames[e].t)/2 : null;
+  const done = tEnd !== null, complete = done || final;
+  const Npk0 = done ? Math.max(0, Math.round((tEnd - tS)/T0))
+                    : Math.max(0, Math.floor((tLast - tS)/T0 - 0.75) + 1);
+  const attempt = (T, shift, count, guess) => {
+    const pk = readPackets(cal, tS + shift*T0, T, 0, count);
+    return {pk, rs: rsProcess(pk, complete, guess), T, shift};
+  };
+  /* 先用校準得到的起點與你設定的封包時間（發射端是用絕對時間排程，封包時間很準） */
+  let best = attempt(T0, 0, Npk0, false);
+  /* 驗證失敗 → 以 CRC 當裁判，搜尋封包時間（±2%）與起點偏移（±0.16 個封包），標頭宣告的封包數優先 */
+  if(complete && best.rs.stage !== 'ok'){
+    const tBegin = Date.now(), hdrOk = best.rs.hdr && best.rs.hdr.ok;
+    const nWant = hdrOk ? best.rs.hdr.nTotal : Npk0;
+    const cands = [];
+    const addC = (T, cnt) => { if(cnt >= HDR_N) cands.push([T, cnt]); };
+    addC(T0, nWant);
+    if(tEnd !== null) for(const cnt of [nWant, Npk0, Npk0-1, Npk0+1]){
+      const Tc = (tEnd - tS) / cnt; if(Math.abs(Tc - T0) < 0.12*T0) addC(Tc, cnt);
+    }
+    for(const f of [0.995, 1.005, 0.99, 1.01, 0.98, 1.02]) addC(T0*f, nWant);
+    search: for(const sh of [0, -0.08, 0.08, -0.16, 0.16]){
+      for(const [Tc, cnt] of cands){
+        if(sh === 0 && Tc === T0 && cnt === Npk0) continue;
+        if(Date.now() - tBegin > 15000) break search;
+        const a = attempt(Tc, sh, cnt, false);
+        if(a.rs.stage === 'ok'){ best = a; break search; }
+        if(a.rs.hdr && a.rs.hdr.ok && !(best.rs.hdr && best.rs.hdr.ok)) best = a;
+      }
+    }
+    /* 最後手段：標頭救不回來時，由封包總數反推 (K, nsym) */
+    if(best.rs.stage !== 'ok' && !(best.rs.hdr && best.rs.hdr.ok)){
+      const a = attempt(best.T, best.shift, best.pk.syms.length, true);
+      if(a.rs.stage === 'ok') best = a;
+    }
+  }
+  const pk = best.pk, rs = best.rs;
+  const hex = pk.nibs.map(t => HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]).join('');
+  const finished = complete && (rs.stage === 'ok' || rs.stage === 'data-fail' || rs.stage === 'hdr-fail');
+  return {state: finished ? 'done' : 'rx', done: done || finished, nibs: pk.nibs, flags: pk.flags, hex, T: best.T, Npk: pk.syms.length, cal, rs};
 }
 function analyze(final, msIn){
   const n = frames.length;
@@ -570,17 +854,41 @@ function drawCurves(cal){
 function render(res){
   let s = res.msg || '';
   if(res.nibs){
+    const rs = res.rs || {}, H = rs.hdr, D = rs.data;
     const bad = res.flags.filter(x=>x===2).length, warn = res.flags.filter(x=>x===1).length;
-    s = (res.done ? '✔ 接收完成\n' : '接收中…\n') +
-        `校準：已完成　封包時間 ≈ ${res.T.toFixed(1)} ms\n` +
-        calSummary(res.cal) + '\n' +
-        `封包 ${res.Npk} 個（${res.Npk*3} 個 hex 字元）　信心偏低 ${warn}　疑似錯誤 ${bad}`;
+    const lines = [
+      (D && D.ok) ? '✔ 接收完成，Reed-Solomon 校驗通過' :
+      rs.stage === 'data-fail' ? '✘ 校驗失敗：錯誤超出 Reed-Solomon 可修正的範圍（下方為未修正的原始內容）' :
+      rs.stage === 'hdr-fail' ? '✘ 標頭無法解出（下方為未修正的原始內容）' :
+      res.done ? '接收完成' : '接收中…',
+      `校準：已完成　封包時間 ≈ ${res.T.toFixed(1)} ms`,
+      calSummary(res.cal),
+      `收到封包 ${res.Npk} 個　信心偏低 ${warn}　疑似錯誤 ${bad}`
+    ];
+    if(H && H.ok){
+      lines.push(`標頭：✔ 資料符號 ${H.K}（含 CRC 2）、校驗 ${H.nsym}、共 ${H.nTotal} 個封包` + (H.nErr || H.nEra ? `　標頭已修正 ${H.nErr} 錯誤` : ''));
+      if(rs.stage === 'partial') lines.push(`尚未收齊：還差 ${H.nTotal - res.Npk} 個封包`);
+    } else if(H && H.guessed) lines.push(`標頭：✘ 無法解出，改由封包總數反推（資料符號 ${H.K}、校驗 ${H.nsym}），資料 CRC 驗證通過`);
+    else if(H) lines.push('標頭：✘ 無法解出');
+    if(rs.missing) lines.push(`缺少 ${rs.missing} 個封包，已當作抹除處理`);
+    if(D && D.ok){
+      lines.push(`修正：${D.nErr} 個未知位置的錯誤封包 + 使用 ${D.nEra} 個抹除　（資料 CRC-24 ✔，嘗試 ${D.tried} 次）`);
+    }
+    s = lines.filter(Boolean).join('\n');
     if(res.cal && res.cal !== drawnCal){ drawnCal = res.cal; drawCurves(res.cal); }
+    const fixed = new Set(D && D.ok ? D.fixed : []);
+    const hk = H && (H.ok || H.guessed), nHdr = hk ? HDR_N : 0, K = hk ? H.K : 0;
     $('packets').innerHTML = res.nibs.map((t,i)=>{
-      const cls = res.flags[i]===2 ? 'bad' : res.flags[i]===1 ? 'warn' : '';
+      let cls = res.flags[i]===2 ? 'bad' : res.flags[i]===1 ? 'warn' : '';
+      if(fixed.has(i)) cls = 'fix';
+      if(hk){ if(i < nHdr) cls += ' hdr'; else if(i < nHdr + 2) cls += ' crc'; else if(i >= nHdr + K) cls += ' par'; }
       return `<span class="${cls}">${HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]}</span>`;
     }).join('');
-    let hex = res.hex; const L = +$('len').value;
+    let hex;
+    if(D && D.ok) hex = D.hex;
+    else if(hk) hex = res.hex.slice((nHdr + 2)*3, (nHdr + K)*3);   // 未修正的資料部分
+    else hex = res.hex;
+    const L = +$('len').value;
     if(L > 0) hex = hex.slice(0, L);
     $('hex').value = hex;
     $('textOut').value = hexToText(hex);

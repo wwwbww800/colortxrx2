@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>空間差分色碼發射端</title>
+<title>空間差分色碼發射端（Reed-Solomon）</title>
 <style>
   html,body{margin:0;height:100%;background:#0f0f0f;color:#ddd;font-family:system-ui,"Noto Sans TC",sans-serif}
   body{display:flex;align-items:stretch}
   #panel{width:320px;padding:16px;box-sizing:border-box;display:flex;flex-direction:column;gap:8px;justify-content:flex-end;overflow:auto}
+  #panel>*{flex-shrink:0}
   #panel label{font-size:12px;color:#999}
   input,textarea,button{font-size:16px;padding:6px 8px;border-radius:5px;border:2px solid #555;box-sizing:border-box;width:100%}
   textarea{resize:vertical;min-height:70px;font-family:monospace}
@@ -15,10 +16,15 @@
   button.stop{background:#c44}
   button.sec{background:#444}
   #info{font:12px/1.5 monospace;color:#8c8;white-space:pre-wrap;min-height:80px}
-  #preview{font:13px/1.8 monospace;color:#999;max-height:140px;overflow:auto;word-break:break-all}
+  #preview{font:13px/1.8 monospace;color:#999;max-height:140px;min-height:40px;overflow:auto;word-break:break-all}
   #preview span{padding:1px 3px;margin:1px;border-radius:3px;display:inline-block}
   #preview span.cur{background:#2b6;color:#fff}
   #preview span.done{color:#555}
+  #preview span.hdr{color:#c93}
+  #preview span.crc{color:#6ad}
+  #preview span.par{color:#a8c;font-style:italic}
+  #rsinfo{font:12px/1.5 monospace;color:#9ab;white-space:pre-wrap}
+  select{font-size:16px;padding:6px 8px;border-radius:5px;border:2px solid #555;width:100%;box-sizing:border-box}
   #stage{flex:1;display:flex;align-items:flex-start;justify-content:center;padding:16px}
   #grid{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
         width:min(720px,calc(100vh - 32px),calc(100vw - 360px));aspect-ratio:1/1;gap:0}
@@ -32,8 +38,17 @@
 <body>
 <div id="panel">
   <div id="info">待機中</div>
-  <label>封包拆分預覽（每 3 字一個封包）</label>
+  <label>封包預覽（橘 = 標頭、藍 = CRC、白 = 資料、紫斜體 = Reed-Solomon 校驗）</label>
   <div id="preview"></div>
+  <div id="rsinfo"></div>
+  <label>Reed-Solomon 校驗強度（校驗封包數 ÷ 資料封包數；越高越能糾錯，傳送越久）</label>
+  <select id="ratio">
+    <option value="0.25">低 25%</option>
+    <option value="0.5">中 50%</option>
+    <option value="1" selected>高 100%（預設）</option>
+    <option value="2">極高 200%</option>
+    <option value="3">最大 300%</option>
+  </select>
   <label>每個封包顯示時間 (ms)（接收端要設成相同）</label>
   <input id="ms" type="number" value="100" min="80" step="10">
   <label><input id="loop" type="checkbox" style="width:auto"> 完成後循環重送（每輪開始都先自動校準）</label>
@@ -70,35 +85,211 @@ const hx = n => n.toString(16);
    時序：16 段灰階校準 (n,n,n) → 1 格全黑間隔 → 資料封包 → 全黑（結束） */
 const CAL = Array.from({length:16}, (_,n) => [n,n,n]);
 
+/*RS_START*/
+/* ============================================================
+   Reed-Solomon over GF(2^12)：一個符號 = 12 bit = 一個封包（3 個 hex 字元）
+   · 本原多項式 x^12 + x^6 + x^4 + x + 1 (0x1053)，根 α^0 … α^(nsym−1)
+   · 系統碼：資料在前、校驗在後；codeword 長度 n ≤ 4095
+   · 解碼支援「錯誤 + 抹除」：2·錯誤 + 抹除 ≤ nsym（抹除 = 已知位置不可靠的封包）
+   ============================================================ */
+const RS = (() => {
+  const SIZE = 4096, ORDER = 4095, PRIM = 0x1053;
+  const EXP = new Uint16Array(ORDER * 2), LOG = new Uint16Array(SIZE);
+  (function(){
+    let x = 1;
+    for(let i=0;i<ORDER;i++){ EXP[i] = x; LOG[x] = i; x <<= 1; if(x & SIZE) x ^= PRIM; }
+    for(let i=ORDER;i<ORDER*2;i++) EXP[i] = EXP[i-ORDER];
+  })();
+  const mul = (a,b) => (a === 0 || b === 0) ? 0 : EXP[LOG[a] + LOG[b]];
+  const div = (a,b) => a === 0 ? 0 : EXP[LOG[a] + ORDER - LOG[b]];
+  const alpha = n => EXP[((n % ORDER) + ORDER) % ORDER];
+
+  /* 多項式（低次在前） */
+  function pmul(a,b){
+    const r = new Array(a.length + b.length - 1).fill(0);
+    for(let i=0;i<a.length;i++){ if(!a[i]) continue; for(let j=0;j<b.length;j++) r[i+j] ^= mul(a[i], b[j]); }
+    return r;
+  }
+  function peval(p, x){            // 低次在前
+    let acc = 0;
+    for(let i=p.length-1;i>=0;i--) acc = mul(acc, x) ^ p[i];
+    return acc;
+  }
+  const genCache = new Map();
+  function generator(nsym){        // 回傳「高次在前」，首項為 1
+    if(genCache.has(nsym)) return genCache.get(nsym);
+    let g = [1];
+    for(let i=0;i<nsym;i++) g = pmul(g, [alpha(i), 1]);
+    const gh = g.slice().reverse();
+    genCache.set(nsym, gh);
+    return gh;
+  }
+  /* 編碼：msg 為符號陣列（高次在前），回傳 parity（長度 nsym） */
+  function parity(msg, nsym){
+    const gh = generator(nsym), rem = new Array(nsym).fill(0);
+    for(let i=0;i<msg.length;i++){
+      const fb = msg[i] ^ rem[0];
+      for(let j=0;j<nsym;j++){
+        rem[j] = (j+1 < nsym ? rem[j+1] : 0) ^ (fb ? mul(fb, gh[j+1]) : 0);
+      }
+    }
+    return rem;
+  }
+  const encode = (msg, nsym) => msg.concat(parity(msg, nsym));
+
+  function syndromes(c, nsym){
+    const s = new Array(nsym).fill(0);
+    for(let j=0;j<nsym;j++){
+      const x = alpha(j); let acc = 0;
+      for(let i=0;i<c.length;i++) acc = mul(acc, x) ^ c[i];
+      s[j] = acc;
+    }
+    return s;
+  }
+  /* 解碼：recv = 收到的符號（高次在前），erasures = 抹除位置（陣列索引）
+     回傳 {ok, data(更正後 codeword), nErr, nEra, errPos} */
+  function decode(recv, nsym, erasures){
+    const n = recv.length, c = recv.slice();
+    erasures = Array.from(new Set(erasures || [])).filter(i => i >= 0 && i < n);
+    const fail = () => ({ok:false, data:recv.slice(), nErr:0, nEra:erasures.length, errPos:[]});
+    if(n > ORDER || nsym < 1 || nsym >= n) return fail();
+    const syn = syndromes(c, nsym);
+    if(syn.every(v => v === 0)) return {ok:true, data:c, nErr:0, nEra:0, errPos:[]};
+    const rho = erasures.length;
+    if(rho > nsym) return fail();
+    const degOf = i => n - 1 - i;
+    let gamma = [1];
+    for(const e of erasures) gamma = pmul(gamma, [1, alpha(degOf(e))]);
+    let xi = pmul(syn, gamma).slice(0, nsym);
+    while(xi.length < nsym) xi.push(0);
+    const T = xi.slice(rho);
+    /* Berlekamp–Massey（在 Forney 修正後的症狀上找「錯誤」定位多項式） */
+    let C = [1], B = [1], L = 0, m = 1, b = 1;
+    for(let i=0;i<T.length;i++){
+      let d = T[i];
+      for(let j=1;j<=L;j++) if(j < C.length) d ^= mul(C[j], T[i-j]);
+      if(d === 0){ m++; continue; }
+      const coef = div(d, b), Cn = C.slice();
+      while(Cn.length < B.length + m) Cn.push(0);
+      for(let j=0;j<B.length;j++) Cn[j+m] ^= mul(coef, B[j]);
+      if(2*L <= i){ B = C; L = i + 1 - L; b = d; m = 1; } else m++;
+      C = Cn;
+    }
+    while(C.length > 1 && C[C.length-1] === 0) C.pop();
+    const nu = C.length - 1;
+    if(nu !== L || 2*nu + rho > nsym) return fail();
+    /* Chien 搜尋：Λ_e(α^-d) = 0 的 d 就是錯誤的次數位置 */
+    const errDeg = [];
+    for(let d=0; d<n; d++){
+      if(peval(C, alpha(-d)) === 0) errDeg.push(d);
+    }
+    if(errDeg.length !== nu) return fail();
+    const eraDeg = erasures.map(degOf);
+    for(const d of errDeg) if(eraDeg.includes(d)) return fail();
+    const allDeg = eraDeg.concat(errDeg);
+    const lam = pmul(C, gamma);
+    let omega = pmul(syn, lam).slice(0, nsym);
+    const dlam = new Array(Math.max(lam.length - 1, 1)).fill(0);   // 形式導數（特徵 2：只剩奇次項）
+    for(let i=1;i<lam.length;i+=2) dlam[i-1] = lam[i];
+    for(const d of allDeg){
+      const xinv = alpha(-d), X = alpha(d);
+      const den = peval(dlam, xinv);
+      if(den === 0) return fail();
+      const mag = mul(X, div(peval(omega, xinv), den));   // fcr = 0
+      c[n-1-d] ^= mag;
+    }
+    if(!syndromes(c, nsym).every(v => v === 0)) return fail();
+    return {ok:true, data:c, nErr:nu, nEra:rho, errPos:errDeg.map(d => n-1-d)};
+  }
+
+  /* CRC-24（poly 0x864CFB），逐位元處理每個 12 bit 符號 → 回傳 2 個符號 */
+  function crc24(syms){
+    let crc = 0xB704CE;
+    for(const s of syms){
+      for(let b=11;b>=0;b--){
+        const bit = (s >> b) & 1;
+        const top = (crc >> 23) & 1;
+        crc = (crc << 1) & 0xFFFFFF;
+        if(top ^ bit) crc ^= 0x864CFB;
+      }
+    }
+    return [(crc >> 12) & 0xFFF, crc & 0xFFF];
+  }
+  return {encode, parity, decode, crc24, EXP, LOG, SIZE, ORDER};
+})();
+
+/* ============================================================
+   訊框格式
+   [標頭 codeword：3 個資料符號 + HDR_NSYM 個校驗]  [資料 codeword：CRC24(2) + 酬載 + 校驗]
+   標頭資料符號：h0 = (0xA5<<4)|補0數 、h1 = K（資料符號數，含 CRC 的 2 個）、h2 = nsym
+   ============================================================ */
+const HDR_NSYM = 20, HDR_N = 3 + HDR_NSYM, HDR_MAGIC = 0xA5, MIN_NSYM = 16;
+function rsParityFor(K, ratio){ return Math.max(MIN_NSYM, Math.ceil(K * ratio)); }
+/* hex 字串 → 酬載符號（每 3 個 hex 一個符號，不足補 0）與補 0 數 */
+function hexToSyms(hex){
+  const pad = (3 - hex.length % 3) % 3;
+  const h = hex + '0'.repeat(pad), syms = [];
+  for(let i=0;i<h.length;i+=3) syms.push(parseInt(h.slice(i,i+3), 16));
+  return {syms, pad};
+}
+function symsToHex(syms){ return syms.map(s => s.toString(16).padStart(3,'0')).join(''); }
+/* 建立整個訊框；回傳 {symbols, kinds, K, nsym, pad, nTotal} 或 {error} */
+function buildFrame(hex, ratio){
+  const {syms, pad} = hexToSyms(hex);
+  const msg = RS.crc24(syms).concat(syms), K = msg.length;
+  let nsym = rsParityFor(K, ratio);
+  if(K + nsym > RS.ORDER) nsym = RS.ORDER - K;
+  if(nsym < 8) return {error:'訊息太長：資料符號 ' + K + ' 個，超過 Reed-Solomon 上限（4095 個符號含校驗）'};
+  const hdr = RS.encode([(HDR_MAGIC << 4) | pad, K, nsym], HDR_NSYM);
+  const body = RS.encode(msg, nsym);
+  const symbols = hdr.concat(body);
+  const kinds = [].concat(new Array(HDR_N).fill('hdr'), new Array(2).fill('crc'), new Array(syms.length).fill('dat'), new Array(nsym).fill('par'));
+  return {symbols, kinds, K, nsym, pad, nTotal: symbols.length};
+}
+/*RS_END*/
+
+
 /* ============ 輸入 hex → 封包 ============ */
 function cleanHex(s){
   s = s.trim().replace(/^0x/i,'').replace(/[\s:,_-]/g,'');
   if(!/^[0-9a-fA-F]*$/.test(s)) return null;
   return s.toLowerCase();
 }
-function buildPackets(hex){
-  const nibs = [...hex].map(c => parseInt(c,16));
-  while(nibs.length % 3) nibs.push(0);   // 補 0 湊滿 3 字
-  const packets = [];
-  for(let i=0;i<nibs.length;i+=3) packets.push(nibs.slice(i,i+3));
-  return packets;
+/* 訊框 = 標頭 codeword + 資料 codeword（CRC24 + 酬載 + 校驗）；每個 12 bit 符號 = 一個封包 = 3 個 hex 字元 */
+function makeFrame(hex){
+  const f = buildFrame(hex, +$('ratio').value);
+  if(f.error) return f;
+  f.packets = f.symbols.map(s => [(s>>8)&15, (s>>4)&15, s&15]);
+  return f;
 }
+const KIND_NAME = {hdr:'標頭', crc:'CRC', dat:'資料', par:'校驗'};
 
 /* ============ 預覽 ============ */
-function renderPreview(packets){
+function renderPreview(f){
   const box = $('preview'); box.innerHTML = '';
-  packets.forEach((p,i) => {
+  f.packets.forEach((p,i) => {
     const sp = document.createElement('span');
     sp.id = 'pv'+i;
+    sp.className = f.kinds[i];
     sp.textContent = p.map(hx).join('');
     box.appendChild(sp);
   });
+  const ms = Math.max(80, +$('ms').value || 100);
+  const nd = f.kinds.filter(k => k === 'dat').length;
+  $('rsinfo').textContent =
+    `標頭 ${HDR_N} + CRC 2 + 資料 ${nd} + 校驗 ${f.nsym} = 共 ${f.nTotal} 個封包\n` +
+    `可修正：${Math.floor(f.nsym/2)} 個未知位置的錯誤封包，或 ${f.nsym} 個已知位置的抹除封包\n` +
+    `約 ${((f.nTotal + 18) * ms / 1000).toFixed(1)} 秒（含校準）`;
 }
 function updatePreviewFromInput(){
   const h = cleanHex($('txt').value);
-  if(h === null){ $('preview').textContent = '含有非 hex 字元（只能 0-9 a-f）'; return; }
-  renderPreview(buildPackets(h));
+  if(h === null){ $('preview').textContent = '含有非 hex 字元（只能 0-9 a-f）'; $('rsinfo').textContent = ''; return; }
+  const f = makeFrame(h);
+  if(f.error){ $('preview').textContent = f.error; $('rsinfo').textContent = ''; return; }
+  renderPreview(f);
 }
+$('ratio').addEventListener('change', updatePreviewFromInput);
+$('ms').addEventListener('input', updatePreviewFromInput);
 $('txt').addEventListener('input', updatePreviewFromInput);
 
 /* ============ 文字 → hex ============
@@ -140,7 +331,8 @@ function blackScreen(){
 /* ============ 時序（絕對時間排程，不會累積誤差）============ */
 let running = false;
 
-function buildSteps(packets, ms){
+function buildSteps(f, ms){
+  const packets = f.packets;
   const steps = [];
   CAL.forEach((p,n) => steps.push({dur:ms, apply(){
     const c = show(p);
@@ -154,7 +346,7 @@ function buildSteps(packets, ms){
   packets.forEach((p,i) => steps.push({dur:ms, apply(){
     const c = show(p);
     $('info').textContent =
-      `資料封包 ${i+1}/${packets.length}  [${p.map(hx).join('')}]\n基準 ${c.base}\n−10  ${c.a}\n+10  ${c.b}\n灰階 ${GRAY}`;
+      `${KIND_NAME[f.kinds[i]]}封包 ${i+1}/${packets.length}  [${p.map(hx).join('')}]\n基準 ${c.base}\n−10  ${c.a}\n+10  ${c.b}\n灰階 ${GRAY}`;
     highlight(i);
   }}));
   steps.push({dur:1500, apply(){
@@ -196,12 +388,13 @@ function run(steps){
 async function start(){
   const hex = cleanHex($('txt').value);
   if(hex === null || hex.length === 0){ $('info').textContent = '請輸入有效的 hex（0-9 a-f）'; return; }
-  const packets = buildPackets(hex);
-  renderPreview(packets);
+  const frame = makeFrame(hex);
+  if(frame.error){ $('info').textContent = frame.error; return; }
+  renderPreview(frame);
   running = true;
   $('go').textContent = '停止'; $('go').className = 'stop';
   const ms = Math.max(80, +$('ms').value || 100);
-  const steps = buildSteps(packets, ms);
+  const steps = buildSteps(frame, ms);
   let ok;
   do { ok = await run(steps); } while(ok && running && $('loop').checked);
   if(ok) stop(true);
@@ -218,6 +411,7 @@ $('clr').onclick = () => {
   $('txt').value = '';
   $('plain').value = '';
   $('preview').innerHTML = '';
+  $('rsinfo').textContent = '';
   $('info').textContent = '待機中';
   $('cA').style.background = '#5a5a5a';
   $('cB').style.background = '#707070';
