@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>空間差分色碼接收端</title>
+<title>空間差分色碼接收端 v3</title>
 <style>
   *{box-sizing:border-box}
   html,body{margin:0;background:#0f0f0f;color:#ddd;font-family:system-ui,"Noto Sans TC",sans-serif}
@@ -28,6 +28,7 @@
   #packets span.bad{background:#6a1f1f;color:#fcc}
   textarea{font-family:monospace;min-height:90px;resize:vertical}
   small{color:#888}
+  #curve{width:100%;height:auto;border:1px solid #333;border-radius:6px;background:#161616}
 </style>
 </head>
 <body>
@@ -64,6 +65,9 @@
   <div id="live"><div id="sA">−10</div><div id="sB">+10</div><div id="sG">灰階</div><div id="sK">黑</div></div>
   <div id="status">請先啟動相機，把發射端畫面的四個色塊對準取樣框。</div>
 
+  <label>由 16 階灰階校準即時建立的 Gamma 曲線（橫軸 = 螢幕送出值 0–255，縱軸 = 相對灰階 #808080 的響應；實線 = 左上區塊、虛線 = 右上區塊、點 = 實測）</label>
+  <canvas id="curve" width="640" height="220"></canvas>
+
   <label>解碼出的封包（橘 = 信心偏低，紅 = 疑似錯誤）</label>
   <div id="packets"></div>
   <label>hex 輸出</label>
@@ -88,11 +92,26 @@ let frames = [], calObj = null;
 const failed = new Set();
 const clamp = (x,a,b) => Math.max(a, Math.min(b, x));
 const mean3 = (f,o) => (f[o]+f[o+1]+f[o+2]) / 3;
+const wrap256 = x => ((x % 256) + 256) % 256;
+const SENT_A = k => wrap256(16*k - 10);   // 左上區塊（−10）實際送出的值
+const SENT_B = k => 16*k + 10;            // 右上區塊（+10）實際送出的值
+const HEXC = '0123456789abcdef';
 
-/* 校準第 0 格：A 很亮(246)、B 很暗(10)，三個通道都是 */
+/* ============================================================
+   相對比例歸一：n = (X − K) / (G − K)
+   K = 第四區塊（全黑，sent 0）→ 扣掉黑位準、漏光、相機偏移
+   G = 第三區塊（#808080，sent 128）→ 當作 1.0，抵消曝光/白平衡/增益
+   → n 是「相對於灰階的比例」，只和螢幕送出值有關，曝光或白平衡改變時仍穩定。
+   G、K 在整個傳輸中固定不變，所以用前後一段時間平均（pad）降低雜訊。
+   ============================================================ */
+
+/* 校準第 0 格：A = 246（很亮）、B = 10（很暗），三個通道都成立（用歸一後的比例判斷） */
 function isCal0(f){
   for(let c=0;c<3;c++){
-    if(!(f[c] > 1.25*f[6+c] && f[3+c] < 0.55*f[6+c])) return false;
+    const d = f[6+c] - f[9+c];
+    if(d < 15) return false;
+    const nA = (f[c]-f[9+c]) / d, nB = (f[3+c]-f[9+c]) / d;
+    if(!(nA > 1.3 && nB < 0.45)) return false;
   }
   return true;
 }
@@ -101,9 +120,12 @@ function lowerBound(x){
   while(lo<hi){ const m=(lo+hi)>>1; if(frames[m].t < x) lo=m+1; else hi=m; }
   return lo;
 }
-/* 時間窗內的平均（以灰階區塊 G 為基準做曝光正規化；Gref 為 null 時不正規化）
-   回傳 Float32Array(12)，其中 G 保持原始值方便偵測漂移 */
-function windowNorm(t1, t2, Gref){
+/* 時間窗 [t1,t2] 內 A、B 的平均 → 歸一：n = (X − K) / (G − K)
+   G、K 的曝光/增益只會緩慢漂移，所以用窗前後 pad 內的平均（雜訊小）。
+   另外回傳 nb：改用「同一時間窗」內的 K 來扣，專門給黑畫面偵測用——
+   K 的漏光會隨當下畫面亮度變動，只有同一瞬間的 K 才能和黑色的 A、B 對得上。
+   回傳 {n, nb: Float32Array(6) [A.rgb, B.rgb], gk: 各通道 (G−K) 原始差, G, K} */
+function windowNorm(t1, t2, pad){
   let lo = lowerBound(t1), hi = lowerBound(t2), idx = [];
   for(let i=lo;i<hi;i++) idx.push(i);
   if(!idx.length){
@@ -115,27 +137,29 @@ function windowNorm(t1, t2, Gref){
     if(Math.abs(frames[j].t - c) > 120) return null;
     idx = [j];
   }
-  const o = new Float32Array(12);
-  /* 灰階的曝光/增益只會緩慢漂移，所以用窗外前後各 4 個 frame 一起平均，
-     得到平滑的縮放係數，避免單一 frame 的雜訊被放大到其他區塊 */
-  const g0 = Math.max(0, idx[0]-4), g1 = Math.min(frames.length-1, idx[idx.length-1]+4);
-  const gm = [0,0,0];
-  for(let i=g0;i<=g1;i++) for(let c=0;c<3;c++) gm[c] += frames[i].f[6+c];
-  for(let c=0;c<3;c++) gm[c] /= (g1-g0+1);
-  const sc = [0,1,2].map(c => Gref ? clamp(Gref[c] / Math.max(gm[c],1), 0.5, 2) : 1);
+  const last = frames.length - 1;
+  const gl = Math.min(idx[0], lowerBound(t1 - pad));
+  const gh = Math.min(last, Math.max(idx[idx.length-1], lowerBound(t2 + pad) - 1));
+  const G = [0,0,0], K = [0,0,0], Kw = [0,0,0], m = new Float32Array(6);
+  for(let i=gl;i<=gh;i++){
+    const f = frames[i].f;
+    for(let c=0;c<3;c++){ G[c] += f[6+c]; K[c] += f[9+c]; }
+  }
   for(const i of idx){
     const f = frames[i].f;
-    for(let c=0;c<3;c++){
-      o[c]   += f[c]*sc[c];
-      o[3+c] += f[3+c]*sc[c];
-      o[6+c] += f[6+c];
-      o[9+c] += f[9+c]*sc[c];
-    }
+    for(let c=0;c<3;c++){ m[c] += f[c]; m[3+c] += f[3+c]; Kw[c] += f[9+c]; }
   }
-  for(let k=0;k<12;k++) o[k] /= idx.length;
-  return o;
+  const ng = gh - gl + 1, n = new Float32Array(6), nb = new Float32Array(6), gk = [0,0,0];
+  for(let c=0;c<3;c++){
+    G[c] /= ng; K[c] /= ng; m[c] /= idx.length; m[3+c] /= idx.length; Kw[c] /= idx.length;
+    gk[c] = G[c] - K[c];
+    const d = Math.max(gk[c], 8);
+    n[c]  = (m[c]-K[c]) / d;   n[3+c]  = (m[3+c]-K[c]) / d;
+    nb[c] = (m[c]-Kw[c]) / d;  nb[3+c] = (m[3+c]-Kw[c]) / d;
+  }
+  return {n, nb, gk, G, K};
 }
-/* 用 16 格校準的「格內變異最小」找出精確起點 t0 */
+/* 用 16 格校準的「格內變異最小」找出精確起點 t0（只看時間，用原始亮度即可） */
 function refineT0(tg, T){
   const lumAB = f => mean3(f,0) + mean3(f,3);
   const scores = []; let minS = Infinity;
@@ -155,60 +179,165 @@ function refineT0(tg, T){
   const near = scores.filter(x => x[1] <= minS*1.2 + 1).map(x => x[0]).sort((a,b)=>a-b);
   return near[(near.length-1)>>1];
 }
-/* 驗證並建立校準表 */
+
+/* ============================================================
+   Gamma 轉譯曲線：由 16 階灰階校準即時建立
+   曲線 = 「螢幕送出值 s (0..255) → 歸一後的相機響應 n」（每區塊、每通道各一條）
+   資料點：黑格 (0, 黑位準) + 16 格的 (16k−10 或 16k+10, 實測 n)
+   1) 先做單調（非遞減）回歸，去掉雜訊造成的上下抖動
+   2) 再嘗試擬合 n = b + β·(s/128)^γ；殘差夠小就用擬合曲線（可再平滑雜訊），
+      否則（相機有 S 曲線、飽和…）改用實測點的分段線性曲線
+   ============================================================ */
+function pav(ys, ws){
+  const bl = [];
+  for(let i=0;i<ys.length;i++){
+    bl.push({s:ys[i]*ws[i], w:ws[i], n:1});
+    while(bl.length > 1){
+      const a = bl[bl.length-2], b = bl[bl.length-1];
+      if(a.s/a.w <= b.s/b.w) break;
+      bl.splice(bl.length-2, 2, {s:a.s+b.s, w:a.w+b.w, n:a.n+b.n});
+    }
+  }
+  const out = [];
+  for(const b of bl) for(let i=0;i<b.n;i++) out.push(b.s/b.w);
+  return out;
+}
+function buildCurve(pts){
+  pts = pts.slice().sort((p,q) => p[0]-q[0]);
+  const xs = pts.map(p => p[0]), raw = pts.map(p => p[1]), N = xs.length;
+  const mono = pav(raw, pts.map(p => p[0]===0 ? 3 : 1));
+  let sse = 0; for(let i=0;i<N;i++) sse += (raw[i]-mono[i])**2;
+  const rmsPav = Math.sqrt(sse/N);
+  let best = null;
+  for(let g=0.4; g<=4.001; g+=0.02){
+    let sx=0, sy=0, sxx=0, sxy=0;
+    for(let i=0;i<N;i++){ const x = Math.pow(xs[i]/128, g); sx+=x; sy+=raw[i]; sxx+=x*x; sxy+=x*raw[i]; }
+    const den = N*sxx - sx*sx; if(Math.abs(den) < 1e-9) continue;
+    const beta = (N*sxy - sx*sy) / den, b = (sy - beta*sx) / N;
+    if(beta <= 0) continue;
+    let e = 0; for(let i=0;i<N;i++){ const r = raw[i] - (b + beta*Math.pow(xs[i]/128, g)); e += r*r; }
+    if(!best || e < best.e) best = {g, b, beta, e};
+  }
+  const rmsFit = best ? Math.sqrt(best.e/N) : Infinity;
+  let model = 'points', cx = xs, cy = mono;
+  if(best && rmsFit < 0.045){
+    model = 'gamma'; cx = []; cy = [];
+    for(let s=0;s<=255;s++){ cx.push(s); cy.push(best.b + best.beta*Math.pow(s/128, best.g)); }
+  }
+  return {xs:cx, ys:cy, model, gamma: best ? best.g : NaN, rmsFit, rmsPav, rawX:xs, raw};
+}
+function evalCurve(cv, x){
+  const xs = cv.xs, ys = cv.ys, n = xs.length;
+  if(x <= xs[0]) return ys[0] + (ys[1]-ys[0])/(xs[1]-xs[0]) * (x-xs[0]);
+  if(x >= xs[n-1]) return ys[n-1] + (ys[n-1]-ys[n-2])/(xs[n-1]-xs[n-2]) * (x-xs[n-1]);
+  let lo = 0, hi = n-1;
+  while(hi-lo > 1){ const m = (lo+hi)>>1; if(xs[m] <= x) lo = m; else hi = m; }
+  return ys[lo] + (ys[hi]-ys[lo]) * (x-xs[lo]) / (xs[hi]-xs[lo]);
+}
+/* 反曲線：由歸一響應回推「螢幕送出值」 */
+function invCurve(cv, y){
+  const xs = cv.xs, ys = cv.ys, n = xs.length;
+  if(y <= ys[0]){
+    const sl = Math.max((ys[1]-ys[0])/(xs[1]-xs[0]), 1e-3);
+    return clamp(xs[0] + (y-ys[0])/sl, -40, 300);
+  }
+  if(y >= ys[n-1]){
+    const sl = Math.max((ys[n-1]-ys[n-2])/(xs[n-1]-xs[n-2]), 1e-3);
+    return clamp(xs[n-1] + (y-ys[n-1])/sl, -40, 300);
+  }
+  let lo = 0, hi = n-1;
+  while(hi-lo > 1){ const m = (lo+hi)>>1; if(ys[m] < y) lo = m; else hi = m; }
+  const dy = ys[hi] - ys[lo];
+  return dy < 1e-9 ? (xs[lo]+xs[hi])/2 : xs[lo] + (xs[hi]-xs[lo]) * (y-ys[lo]) / dy;
+}
+const slopeAt = (cv, x) => (evalCurve(cv, x+8) - evalCurve(cv, x-8)) / 16;
+
+/* ============================================================
+   驗證並建立校準（歸一 + 曲線）
+   ============================================================ */
 function tryCal(tg, T){
   const t0 = refineT0(tg, T); if(t0 === null) return null;
-  const raw = [];
+  const pad = Math.max(200, 2*T);
+  const cells = [];
   for(let k=0;k<=16;k++){
-    const w = windowNorm(t0+k*T+0.25*T, t0+(k+1)*T-0.25*T, null);
-    if(!w) return null; raw.push(w);
+    const w = windowNorm(t0+k*T+0.25*T, t0+(k+1)*T-0.25*T, pad);
+    if(!w) return null; cells.push(w);
   }
-  const Gref = [0,0,0];
-  for(let k=0;k<16;k++) for(let c=0;c<3;c++) Gref[c] += raw[k][6+c]/16;
-  const Gl = (Gref[0]+Gref[1]+Gref[2])/3;
-  if(Gl < 20) return null;
-  const A=[], B=[], LA=[], LB=[], LK=[];
+  const gk = [0,0,0];
+  for(let k=0;k<16;k++) for(let c=0;c<3;c++) gk[c] += cells[k].gk[c]/16;
+  if((gk[0]+gk[1]+gk[2])/3 < 20) return null;           // 灰階與黑差太小：沒看到螢幕
+  const LA = [], LB = [], LAb = [], LBb = [];
   for(let k=0;k<=16;k++){
-    const w = windowNorm(t0+k*T+0.25*T, t0+(k+1)*T-0.25*T, Gref);
-    if(!w) return null;
-    A.push([w[0],w[1],w[2]]); B.push([w[3],w[4],w[5]]);
-    LA.push(mean3(w,0)); LB.push(mean3(w,3)); LK.push(mean3(w,9));
+    LA.push(mean3(cells[k].n,0));   LB.push(mean3(cells[k].n,3));
+    LAb.push(mean3(cells[k].nb,0)); LBb.push(mean3(cells[k].nb,3));
   }
-  const tol = 0.04*Gl;
-  if(LA[0]-LB[0] < 0.5*Gl) return null;
+  const tol = 0.06;
+  if(LA[0]-LB[0] < 0.5) return null;
   for(let k=0;k<15;k++){
     if(LB[k+1] < LB[k]-tol) return null;
     if(k>=1 && LA[k+1] < LA[k]-tol) return null;
   }
-  if(LB[15]-LB[0] < 0.8*Gl) return null;
-  if(LA[15]-LA[1] < 0.8*Gl) return null;
-  let m = Infinity;
-  for(let k=1;k<16;k++) m = Math.min(m, Math.max(LA[k]-LK[k], LB[k]-LK[k]));
-  const mthr = 0.5*m;
-  if(!(LA[16]-LK[16] < mthr && LB[16]-LK[16] < mthr)) return null;   // 校準後的全黑間隔
-  return {t0, T, Gref, A, B, mthr, Gl};
+  if(LB[15]-LB[0] < 0.8) return null;
+  if(LA[15]-LA[1] < 0.8) return null;
+  /* 全黑間隔 / 黑畫面的判斷：用同時刻 K 扣除後的值（nb） */
+  let mm = Infinity;
+  for(let k=1;k<16;k++) mm = Math.min(mm, Math.max(LAb[k], LBb[k]));
+  const gthr = 0.5*mm + 0.03;
+  if(!(LAb[16] < gthr && LBb[16] < gthr)) return null;   // 校準後的全黑間隔
+  /* 黑畫面門檻：最暗的資料等級響應的一半，但不低於 0.05（約 3 倍單一 frame 的雜訊） */
+  const blackThr = Math.max(0.5*mm, 0.05);
+
+  /* 每區塊、每通道的 gamma 曲線 */
+  const cA = [], cB = [];
+  for(let c=0;c<3;c++){
+    const pa = [[0, cells[16].n[c]]], pb = [[0, cells[16].n[3+c]]];
+    for(let k=0;k<16;k++){ pa.push([SENT_A(k), cells[k].n[c]]); pb.push([SENT_B(k), cells[k].n[3+c]]); }
+    cA.push(buildCurve(pa)); cB.push(buildCurve(pb));
+  }
+  let sq = 0;
+  for(const cv of cA.concat(cB)) sq += (cv.model === 'gamma' ? cv.rmsFit : cv.rmsPav*1.3) ** 2;
+  const sigmaN = clamp(Math.sqrt(sq/6), 0.012, 0.08);    // 歸一響應的雜訊估計
+
+  /* 16 個等級在曲線上的預期響應，與每個等級到最近鄰的距離（用來估信心） */
+  const PA = [], PB = [], DN = [];
+  for(let k=0;k<16;k++){
+    PA.push([0,1,2].map(c => evalCurve(cA[c], SENT_A(k))));
+    PB.push([0,1,2].map(c => evalCurve(cB[c], SENT_B(k))));
+  }
+  for(let k=0;k<16;k++){
+    DN.push([0,1,2].map(c => {
+      let d = Infinity;
+      for(let j=0;j<16;j++) if(j !== k) d = Math.min(d, Math.hypot(PA[k][c]-PA[j][c], PB[k][c]-PB[j][c]));
+      return d;
+    }));
+  }
+  return {t0, T, pad, gk, blackThr, cA, cB, PA, PB, DN, sigmaN};
 }
 function isBlackFrame(f, cal){
-  let al=0, bl=0, kl=0;
+  let al = 0, bl = 0;
   for(let c=0;c<3;c++){
-    const s = clamp(cal.Gref[c] / Math.max(f[6+c],1), 0.5, 2);
-    al += f[c]*s; bl += f[3+c]*s; kl += f[9+c]*s;
+    const d = Math.max(cal.gk[c], 8);
+    al += (f[c]-f[9+c]) / d; bl += (f[3+c]-f[9+c]) / d;
   }
-  return (al-kl)/3 < cal.mthr && (bl-kl)/3 < cal.mthr;
+  return (al/3) < cal.blackThr && (bl/3) < cal.blackThr;
 }
-const HEXC = '0123456789abcdef';
 function decodeWith(cal, final){
   const n = frames.length, tLast = frames[n-1].t;
   let T = cal.T; const t0 = cal.t0;
   const dataStart = t0 + 17*T;
-  /* 找結束的全黑畫面 */
+  /* 找結束的全黑畫面：持續 ≥ 3 個封包時間，且其中 ≥ 85% 的 frame 為黑 */
+  const i0 = lowerBound(dataStart);
+  const pre = new Int32Array(n+1), isB = new Uint8Array(n);
+  for(let i=0;i<n;i++){
+    isB[i] = (i >= i0 && isBlackFrame(frames[i].f, cal)) ? 1 : 0;
+    pre[i+1] = pre[i] + isB[i];
+  }
   let e = -1;
-  for(let i=lowerBound(dataStart); i<n; i++){
-    if(isBlackFrame(frames[i].f, cal)){
-      let j = i; while(j+1<n && isBlackFrame(frames[j+1].f, cal)) j++;
-      if(j-i >= 1 && frames[j].t - frames[i].t >= 0.3*T){ e = i; break; }
-      i = j;
-    }
+  for(let i=Math.max(i0,1); i<n; i++){
+    if(!isB[i]) continue;
+    const j = lowerBound(frames[i].t + 3*T);
+    if(j >= n) break;
+    if(pre[j]-pre[i] >= 0.85*(j-i)){ e = i; break; }
   }
   let Npk, done = false;
   if(e > 0){
@@ -223,26 +352,34 @@ function decodeWith(cal, final){
   const nibs = [], flags = [];
   for(let m=0;m<Npk;m++){
     const s = t0 + 17*T + m*T;
-    const w = windowNorm(s+0.25*T, s+0.75*T, cal.Gref);
+    const w = windowNorm(s+0.25*T, s+0.75*T, cal.pad);
     if(!w){ nibs.push([0,0,0]); flags.push(2); continue; }
     const tri = [0,0,0]; let flag = 0;
     for(let c=0;c<3;c++){
-      const a = w[c], b = w[3+c];
+      const a = w.n[c], b = w.n[3+c];
+      /* 在歸一響應空間找最近的等級（雜訊在此空間近似均勻） */
       let best = Infinity, bi = 0;
       for(let k=0;k<16;k++){
-        const d = (a-cal.A[k][c])**2 + (b-cal.B[k][c])**2;
+        const d = (a-cal.PA[k][c])**2 + (b-cal.PB[k][c])**2;
         if(d < best){ best = d; bi = k; }
       }
       tri[c] = bi;
-      const dist = Math.sqrt(best);
-      if(dist > 12) flag = Math.max(flag, 2); else if(dist > 8) flag = Math.max(flag, 1);
-      const gr = w[6+c] / cal.Gref[c];
-      if(gr < 0.75 || gr > 1.33) flag = Math.max(flag, 1);      // 灰階區塊漂移過大
+      const ratio = Math.sqrt(best) / Math.max(cal.DN[bi][c], 1e-6);   // 離最近等級的距離 / 與鄰近等級的間距
+      if(ratio > 0.45) flag = Math.max(flag, 2); else if(ratio > 0.30) flag = Math.max(flag, 1);
+      /* ±10 差分驗證：經反曲線回推螢幕送出值後，右上 − 左上 應 = +20（對 256 取餘） */
+      const sa = invCurve(cal.cA[c], a), sb = invCurve(cal.cB[c], b);
+      let diff = sb - sa; diff = wrap256(diff + 128) - 128;
+      const sla = Math.max(slopeAt(cal.cA[c], sa), 0.0015), slb = Math.max(slopeAt(cal.cB[c], sb), 0.0015);
+      const z = Math.abs(diff - 20) / (cal.sigmaN * Math.hypot(1/sla, 1/slb));
+      if(z > 6) flag = Math.max(flag, 2); else if(z > 3.5) flag = Math.max(flag, 1);
+      /* 每個封包的灰階/黑區塊：曝光或白平衡偏離校準時的程度 */
+      const gr = w.gk[c] / cal.gk[c];
+      if(gr < 0.7 || gr > 1.43) flag = Math.max(flag, 1);
     }
     nibs.push(tri); flags.push(flag);
   }
   const hex = nibs.map(t => HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]).join('');
-  return {state: done ? 'done' : 'rx', done, nibs, flags, hex, T, Npk};
+  return {state: done ? 'done' : 'rx', done, nibs, flags, hex, T, Npk, cal};
 }
 function analyze(final, msIn){
   const n = frames.length;
@@ -256,7 +393,7 @@ function analyze(final, msIn){
     if(!isCal0(frames[i].f) || isCal0(frames[i-1].f)) continue;
     const key = Math.round(frames[i].t/50);
     if(failed.has(key)) continue;
-    if(tLast < frames[i].t + 17.6*T0) return {state:'cal', msg:'偵測到可能的校準開頭，收集校準資料中…'};
+    if(tLast < frames[i].t + 17.6*T0 + Math.max(200, 2*T0)) return {state:'cal', msg:'偵測到可能的校準開頭，收集校準資料中…'};
     const cal = tryCal(frames[i].t - dtMed/2, T0);
     if(!cal){ failed.add(key); continue; }
     calObj = cal;
@@ -386,20 +523,59 @@ $('lock').onclick = async () => {
     adv.whiteBalanceMode = 'manual'; if(st.colorTemperature) adv.colorTemperature = st.colorTemperature; msg.push('白平衡：手動');
   } else msg.push('白平衡：此瀏覽器/裝置不支援鎖定');
   if(Object.keys(adv).length){ try{ await tr.applyConstraints({advanced:[adv]}); }catch(e){ msg.push('套用失敗：'+e.message); } }
-  msg.push('（不支援時，程式仍會用每個封包的灰階區塊補償曝光漂移）');
+  msg.push('（不支援時也沒關係：接收端會把左上/右上區塊相對於灰階與全黑區塊做比例歸一，抵消曝光與白平衡的變動）');
   $('status').textContent = msg.join('\n');
 };
 
 /* ============================================================
    接收流程
    ============================================================ */
+/* 校準摘要：歸一基準與 gamma 曲線資訊 */
+function calSummary(cal){
+  if(!cal) return '';
+  const fmt = v => Number.isFinite(v) ? v.toFixed(2) : '—';
+  const gm = c => { const a = cal.cA[c].gamma, b = cal.cB[c].gamma; return fmt((a+b)/2); };
+  const mod = cal.cA.concat(cal.cB).every(cv => cv.model === 'gamma') ? 'γ 擬合曲線' : '實測點分段線性曲線';
+  return `歸一基準 G−K（灰階−黑）：R ${cal.gk[0].toFixed(0)} / G ${cal.gk[1].toFixed(0)} / B ${cal.gk[2].toFixed(0)}\n` +
+         `系統 Gamma：R ${gm(0)} / G ${gm(1)} / B ${gm(2)}　曲線：${mod}　雜訊 σ≈${cal.sigmaN.toFixed(3)}`;
+}
+/* 畫出由 16 階灰階建立的曲線（R/G/B 各一色；實線=左上、虛線=右上、點=實測） */
+let drawnCal = null;
+function clearCurves(){ drawnCal = null; const cv = $('curve'); cv.getContext('2d').clearRect(0,0,cv.width,cv.height); }
+function drawCurves(cal){
+  const cv = $('curve'), g = cv.getContext('2d'), W = cv.width, H = cv.height;
+  const L = 36, R = 10, Tp = 10, B = 22;
+  g.clearRect(0,0,W,H); g.fillStyle = '#161616'; g.fillRect(0,0,W,H);
+  let ymax = 1.2;
+  for(let c=0;c<3;c++) ymax = Math.max(ymax, evalCurve(cal.cA[c],250), evalCurve(cal.cB[c],250));
+  ymax = Math.ceil(ymax*5)/5;
+  const X = s => L + s/255*(W-L-R), Y = y => H-B - clamp(y,-0.05,ymax)/ymax*(H-B-Tp);
+  g.font = '11px sans-serif'; g.lineWidth = 1; g.strokeStyle = '#333'; g.fillStyle = '#888';
+  for(let s=0;s<=255;s+=64){ g.beginPath(); g.moveTo(X(s),Tp); g.lineTo(X(s),H-B); g.stroke(); g.fillText(String(s), X(s)-8, H-6); }
+  g.fillText('255', X(255)-18, H-6);
+  for(let y=0;y<=ymax+1e-6;y+=0.5){ g.beginPath(); g.moveTo(L,Y(y)); g.lineTo(W-R,Y(y)); g.stroke(); g.fillText(y.toFixed(1), 4, Y(y)+4); }
+  g.strokeStyle = '#777'; g.setLineDash([2,4]);                     // 灰階基準：(128, 1.0)
+  g.beginPath(); g.moveTo(X(128),Tp); g.lineTo(X(128),H-B); g.moveTo(L,Y(1)); g.lineTo(W-R,Y(1)); g.stroke(); g.setLineDash([]);
+  const col = ['#f66','#6d6','#6af'];
+  for(let c=0;c<3;c++){
+    [[cal.cA[c], false],[cal.cB[c], true]].forEach(([cur, dashed]) => {
+      g.strokeStyle = col[c]; g.fillStyle = col[c]; g.lineWidth = 1.5; g.setLineDash(dashed ? [5,3] : []);
+      g.beginPath();
+      for(let s=0;s<=255;s+=3){ const px = X(s), py = Y(evalCurve(cur, s)); if(s===0) g.moveTo(px,py); else g.lineTo(px,py); }
+      g.stroke(); g.setLineDash([]);
+      for(let i=0;i<cur.rawX.length;i++){ g.beginPath(); g.arc(X(cur.rawX[i]), Y(cur.raw[i]), 2, 0, 6.3); g.fill(); }
+    });
+  }
+}
 function render(res){
   let s = res.msg || '';
   if(res.nibs){
     const bad = res.flags.filter(x=>x===2).length, warn = res.flags.filter(x=>x===1).length;
     s = (res.done ? '✔ 接收完成\n' : '接收中…\n') +
         `校準：已完成　封包時間 ≈ ${res.T.toFixed(1)} ms\n` +
+        calSummary(res.cal) + '\n' +
         `封包 ${res.Npk} 個（${res.Npk*3} 個 hex 字元）　信心偏低 ${warn}　疑似錯誤 ${bad}`;
+    if(res.cal && res.cal !== drawnCal){ drawnCal = res.cal; drawCurves(res.cal); }
     $('packets').innerHTML = res.nibs.map((t,i)=>{
       const cls = res.flags[i]===2 ? 'bad' : res.flags[i]===1 ? 'warn' : '';
       return `<span class="${cls}">${HEXC[t[0]]+HEXC[t[1]]+HEXC[t[2]]}</span>`;
@@ -428,7 +604,7 @@ let timer = null;
 function startListen(){
   if(!stream){ $('status').textContent = '請先啟動相機'; return; }
   frames.length = 0; calObj = null; failed.clear();
-  $('packets').innerHTML = ''; $('hex').value = ''; $('textOut').value = '';
+  $('packets').innerHTML = ''; $('hex').value = ''; $('textOut').value = ''; clearCurves();
   listening = true;
   $('go').textContent = '停止並解碼'; $('go').className = 'stop';
   $('status').textContent = '監聽中… 請在發射端按「開始傳送」。';
@@ -448,7 +624,7 @@ $('go').onclick = () => listening ? stopListen(true) : startListen();
 $('rst').onclick = () => {
   stopListen(false);
   frames.length = 0; calObj = null; failed.clear();
-  $('packets').innerHTML = ''; $('hex').value = ''; $('textOut').value = '';
+  $('packets').innerHTML = ''; $('hex').value = ''; $('textOut').value = ''; clearCurves();
   $('status').textContent = '已重置。';
 };
 $('copyText').onclick = async () => {
